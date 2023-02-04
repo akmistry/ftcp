@@ -56,5 +56,8 @@ func (s *IPSocket) ReadPacket() (*IPPacket, error) {
 		return nil, err
 	}
 	buf = buf[:n]
+	// TODO: Don't do this. It makes it impossible to distinguish between a
+	// socket error and packet parsing error (i.e. malformed packet). The latter
+	// is non-fatal.
 	return MakeIPPacket(buf)
 }

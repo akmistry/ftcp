@@ -14,12 +14,18 @@ var (
 )
 
 const (
-	flagFin = 1 << 0
-	flagSyn = 1 << 1
-	flagRst = 1 << 2
-	flagPsh = 1 << 3
-	flagAck = 1 << 4
-	flagUrg = 1 << 5
+	tcpFlagFin = 1 << 0
+	tcpFlagSyn = 1 << 1
+	tcpFlagRst = 1 << 2
+	tcpFlagPsh = 1 << 3
+	tcpFlagAck = 1 << 4
+	tcpFlagUrg = 1 << 5
+
+	TcpOptionMss           = 2
+	TcpOptionWindowScaling = 3
+	TcpOptionSackPermitted = 4
+	TcpOptionSack          = 5
+	TcpOptionTimestamp     = 8
 )
 
 func isFlag(v, f byte) bool {
@@ -68,12 +74,12 @@ func ParseTCPHeader(buf []byte) (*TCPHeader, error) {
 		SeqNum:        be.Uint32(buf[4:8]),
 		AckNum:        be.Uint32(buf[8:12]),
 		DataOff:       int(buf[12]>>4) * 4,
-		Fin:           isFlag(buf[13], flagFin),
-		Syn:           isFlag(buf[13], flagSyn),
-		Rst:           isFlag(buf[13], flagRst),
-		Psh:           isFlag(buf[13], flagPsh),
-		Ack:           isFlag(buf[13], flagAck),
-		Urg:           isFlag(buf[13], flagUrg),
+		Fin:           isFlag(buf[13], tcpFlagFin),
+		Syn:           isFlag(buf[13], tcpFlagSyn),
+		Rst:           isFlag(buf[13], tcpFlagRst),
+		Psh:           isFlag(buf[13], tcpFlagPsh),
+		Ack:           isFlag(buf[13], tcpFlagAck),
+		Urg:           isFlag(buf[13], tcpFlagUrg),
 		WindowSize:    int(be.Uint16(buf[14:16])),
 		Checksum:      be.Uint16(buf[16:18]),
 		UrgentPointer: int(be.Uint16(buf[18:20])),
@@ -96,16 +102,11 @@ func ParseTCPHeader(buf []byte) (*TCPHeader, error) {
 		}
 		optionLen := opts[off+1]
 		switch optionKind {
-		case 2:
-			// MSS
-		case 3:
-			// Window scaling
-		case 4:
-			// SACK permitted
-		case 5:
-			// SACK
-		case 8:
-			// Timestamp
+		case TcpOptionMss:
+		case TcpOptionWindowScaling:
+		case TcpOptionSackPermitted:
+		case TcpOptionSack:
+		case TcpOptionTimestamp:
 			if optionLen != 10 {
 				log.Printf("Invalid TCP timestamp length: %d", optionLen)
 				break
@@ -126,9 +127,11 @@ func ParseTCPHeader(buf []byte) (*TCPHeader, error) {
 
 func (h *TCPHeader) String() string {
 	return fmt.Sprintf("src_port=%d dst_port=%d seq=%d ack=%d data_offset=%d "+
-		"fin=%t syn=%t rst=%t psh=%t ack=%t urg=%t timestamp=(%v)",
+		"fin=%t syn=%t rst=%t psh=%t ack=%t urg=%t window_size=%d timestamp=(%v)",
 		h.SrcPort, h.DstPort,
 		h.SeqNum, h.AckNum,
 		h.DataOff,
-		h.Fin, h.Syn, h.Rst, h.Psh, h.Ack, h.Urg, h.Timestamp)
+		h.Fin, h.Syn, h.Rst, h.Psh, h.Ack, h.Urg,
+		h.WindowSize,
+		h.Timestamp)
 }

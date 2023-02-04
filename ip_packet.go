@@ -7,8 +7,8 @@ import (
 )
 
 type IPPacket struct {
+	Header *ipv4.Header
 	buf    []byte
-	header *ipv4.Header
 }
 
 func MakeIPPacket(buf []byte) (*IPPacket, error) {
@@ -22,16 +22,15 @@ func MakeIPPacket(buf []byte) (*IPPacket, error) {
 	buf = buf[:header.TotalLen]
 	packet := &IPPacket{
 		buf:    buf,
-		header: header,
+		Header: header,
 	}
 	return packet, nil
 }
 
 func (p *IPPacket) String() string {
-	return p.header.String()
+	return p.Header.String()
 }
 
 func (p *IPPacket) Payload() []byte {
-	offset := p.header.Len
-	return p.buf[offset:]
+	return p.buf[p.Header.Len:]
 }
