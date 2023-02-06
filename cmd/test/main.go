@@ -13,7 +13,10 @@ func main() {
 	ipAddr := net.IPv4(192, 168, 1, 134)
 	listenPort := uint16(9999)
 
-	sock, err := dtcp.OpenIPSocket(ipAddr)
+	//listenIpAddr := net.IPv4(0, 0, 0, 0)
+	//listenIpAddr := ipAddr
+	//sock, err := dtcp.OpenIPSocket(listenIpAddr)
+	sock, err := dtcp.OpenRawSocket()
 	if err != nil {
 		panic(err)
 	}
@@ -21,16 +24,24 @@ func main() {
 
 	connMap := dtcp.MakeTCPConnMap()
 
+	buf := make([]byte, 65536)
 	for {
-		packet, err := sock.ReadPacket()
+		n, err := sock.Read(buf)
 		if err != nil {
 			log.Printf("Error reading IP packet: %v", err)
 			panic(err)
 		}
+		packet, err := dtcp.MakeIPPacket(buf[:n])
+		if err != nil {
+			log.Printf("Error parsing IP packet: %v", err)
+			continue
+		}
 		if packet.Header.Protocol != unix.IPPROTO_TCP {
+			//log.Printf("IP protocl: %d", packet.Header.Protocol)
 			// Not a TCP packet, ignore
 			continue
 		} else if !packet.Header.Dst.Equal(ipAddr) {
+			//log.Printf("IP dst: %v", packet.Header.Dst)
 			// Dest address != listening address
 			continue
 		}
@@ -40,6 +51,7 @@ func main() {
 			continue
 		}
 		if tcpHeader.DstPort != listenPort {
+			//log.Printf("TCP dst port: %d", tcpHeader.DstPort)
 			// Not the port we're listening on
 			continue
 		}

@@ -1,16 +1,14 @@
 package dtcp
 
 import (
+	"io"
 	"net"
+	"os"
 
 	"golang.org/x/sys/unix"
 )
 
-type IPSocket struct {
-	conn *net.IPConn
-}
-
-func OpenIPSocket(addr net.IP) (*IPSocket, error) {
+func OpenIPSocket(addr net.IP) (*net.IPConn, error) {
 	ipAddr := &net.IPAddr{
 		IP:   addr,
 		Zone: "",
@@ -37,27 +35,17 @@ func OpenIPSocket(addr net.IP) (*IPSocket, error) {
 		conn.Close()
 		return nil, sockOptErr
 	}
-
-	sock := &IPSocket{
-		conn: conn,
-	}
-	return sock, nil
+	return conn, nil
 }
 
-func (s *IPSocket) Close() error {
-	return s.conn.Close()
+func htons(v uint16) uint16 {
+	return ((v & 0xFF) << 8) | ((v & 0xFF00) >> 8)
 }
 
-func (s *IPSocket) ReadPacket() (*IPPacket, error) {
-	// TODO: Struct/interface for buffer reuse
-	buf := make([]byte, 2048)
-	n, err := s.conn.Read(buf)
+func OpenRawSocket() (io.ReadCloser, error) {
+	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_DGRAM, int(htons(unix.ETH_P_IP)))
 	if err != nil {
 		return nil, err
 	}
-	buf = buf[:n]
-	// TODO: Don't do this. It makes it impossible to distinguish between a
-	// socket error and packet parsing error (i.e. malformed packet). The latter
-	// is non-fatal.
-	return MakeIPPacket(buf)
+	return os.NewFile(uintptr(fd), "<raw socket>"), nil
 }
