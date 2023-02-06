@@ -34,3 +34,21 @@ func (p *IPPacket) String() string {
 func (p *IPPacket) Payload() []byte {
 	return p.buf[p.Header.Len:]
 }
+
+func IPChecksum(packet []byte) uint16 {
+	if len(packet) < 20 {
+		panic("Invalid packet length")
+	}
+
+	var sum tcpChecksum
+	sum.AddBuf(packet[0:10])
+	sum.AddBuf(packet[12:])
+	return sum.Sum()
+}
+
+func IPSetChecksum(packet []byte, sum uint16) {
+	if len(packet) < 20 {
+		panic("Invalid packet length")
+	}
+	be.PutUint16(packet[10:12], sum)
+}

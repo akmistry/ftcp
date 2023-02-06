@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 )
 
 var (
@@ -30,6 +31,13 @@ const (
 
 func isFlag(v, f byte) bool {
 	return (v & f) == f
+}
+
+func toFlag(v bool, f byte) byte {
+	if v {
+		return f
+	}
+	return 0
 }
 
 type TCPTimestamp struct {
@@ -127,11 +135,87 @@ func ParseTCPHeader(buf []byte) (*TCPHeader, error) {
 
 func (h *TCPHeader) String() string {
 	return fmt.Sprintf("src_port=%d dst_port=%d seq=%d ack=%d data_offset=%d "+
-		"fin=%t syn=%t rst=%t psh=%t ack=%t urg=%t window_size=%d timestamp=(%v)",
+		"fin=%t syn=%t rst=%t psh=%t ack=%t urg=%t window_size=%d timestamp=(%v) "+
+		"checksum=0x%04x",
 		h.SrcPort, h.DstPort,
 		h.SeqNum, h.AckNum,
 		h.DataOff,
 		h.Fin, h.Syn, h.Rst, h.Psh, h.Ack, h.Urg,
 		h.WindowSize,
-		h.Timestamp)
+		h.Timestamp, h.Checksum)
+}
+
+func (h *TCPHeader) MarshalAppend(buf []byte) ([]byte, error) {
+	var tcpHead [20]byte
+	be.PutUint16(tcpHead[0:2], h.SrcPort)
+	be.PutUint16(tcpHead[2:4], h.DstPort)
+	be.PutUint32(tcpHead[4:8], h.SeqNum)
+	be.PutUint32(tcpHead[8:12], h.AckNum)
+	tcpHead[12] = (20 /* TODO: Replace with header size including options */ / 4) << 4
+	flags := toFlag(h.Fin, tcpFlagFin) |
+		toFlag(h.Syn, tcpFlagSyn) |
+		toFlag(h.Rst, tcpFlagRst) |
+		toFlag(h.Psh, tcpFlagPsh) |
+		toFlag(h.Ack, tcpFlagAck) |
+		toFlag(h.Urg, tcpFlagUrg)
+	tcpHead[13] = flags
+	// TODO: Support window scaling
+	be.PutUint16(tcpHead[14:16], uint16(h.WindowSize))
+	// UrgentPointer = 0
+
+	return append(buf, tcpHead[:]...), nil
+}
+
+type tcpChecksum struct {
+	sum uint32
+}
+
+func (c *tcpChecksum) AddBuf(buf []byte) {
+	for i := 0; i < len(buf); i += 2 {
+		if i+1 >= len(buf) {
+			c.sum += uint32(buf[i]) << 8
+		} else {
+			c.sum += uint32(be.Uint16(buf[i : i+2]))
+		}
+	}
+}
+
+func (c *tcpChecksum) Sum() uint16 {
+	return ^(uint16(c.sum) + uint16(c.sum>>16))
+}
+
+func TCPChecksum(packet []byte, srcAddr, dstAddr net.IP) uint16 {
+	if len(packet) < 20 {
+		panic("Invalid packet length")
+	}
+
+	srcAddr = srcAddr.To4()
+	dstAddr = dstAddr.To4()
+
+	var pseudoHeader [12]byte
+	pseudoHeader[0] = srcAddr[0]
+	pseudoHeader[1] = srcAddr[1]
+	pseudoHeader[2] = srcAddr[2]
+	pseudoHeader[3] = srcAddr[3]
+	pseudoHeader[4] = dstAddr[0]
+	pseudoHeader[5] = dstAddr[1]
+	pseudoHeader[6] = dstAddr[2]
+	pseudoHeader[7] = dstAddr[3]
+	pseudoHeader[8] = 0
+	pseudoHeader[9] = 6
+	be.PutUint16(pseudoHeader[10:12], uint16(len(packet)))
+
+	var sum tcpChecksum
+	sum.AddBuf(pseudoHeader[:])
+	sum.AddBuf(packet[0:16])
+	sum.AddBuf(packet[18:])
+
+	return sum.Sum()
+}
+
+func TCPSetChecksum(packet []byte, sum uint16) {
+	if len(packet) < 20 {
+		panic("Invalid packet length")
+	}
+	be.PutUint16(packet[16:18], sum)
 }

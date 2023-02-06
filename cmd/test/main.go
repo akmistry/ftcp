@@ -4,6 +4,7 @@ import (
 	"log"
 	"net"
 
+	"golang.org/x/net/ipv4"
 	"golang.org/x/sys/unix"
 
 	"github.com/akmistry/dtcp"
@@ -21,6 +22,11 @@ func main() {
 		panic(err)
 	}
 	log.Print("RAW socket opened")
+
+	sendSock, err := dtcp.OpenIPSocket(net.IPv4(0, 0, 0, 0))
+	if err != nil {
+		panic(err)
+	}
 
 	connMap := dtcp.MakeTCPConnMap()
 
@@ -55,6 +61,12 @@ func main() {
 			// Not the port we're listening on
 			continue
 		}
+		calcTcpChecksum := dtcp.TCPChecksum(packet.Payload(), packet.Header.Src, packet.Header.Dst)
+		if tcpHeader.Checksum != calcTcpChecksum {
+			log.Printf("TCP checksum 0x%04x != calculated checksum 0x%04x",
+				tcpHeader.Checksum, calcTcpChecksum)
+			continue
+		}
 
 		log.Printf("Read packet: %v", packet)
 		log.Printf("Payload: %v", packet.Payload())
@@ -62,16 +74,49 @@ func main() {
 
 		var tcpConn *dtcp.TCPConnState
 		if tcpHeader.Syn {
+			log.Print("New TCP connection")
 			// SYN packet, so this is a new connection.
-			tcpConn = dtcp.NewTCPConnState()
+			tcpConn = dtcp.NewTCPConnState(0, tcpHeader.SeqNum)
 			connMap.PutState(packet.Header.Src, tcpHeader.SrcPort, tcpConn)
 		} else {
+			log.Print("Existing TCP connection")
 			tcpConn = connMap.GetState(packet.Header.Src, tcpHeader.SrcPort)
 		}
 		if tcpConn == nil {
 			// No active connection found, drop packet.
 			continue
 		}
+
+		resp := tcpConn.GenerateRespHeader()
+		resp.SrcPort = tcpHeader.DstPort
+		resp.DstPort = tcpHeader.SrcPort
+		resp.Syn = tcpHeader.Syn
+
+		respIp := &ipv4.Header{
+			Version:  ipv4.Version,
+			Len:      ipv4.HeaderLen,
+			TotalLen: 20 + 20,
+			FragOff:  0,
+			TTL:      32,
+			Protocol: 6,
+			Src:      ipAddr,
+			Dst:      packet.Header.Src.To4(),
+		}
+		respIpHeader, err := respIp.Marshal()
+		if err != nil {
+			panic(err)
+		}
+		dtcp.IPSetChecksum(respIpHeader, dtcp.IPChecksum(respIpHeader))
+		respPacket, err := resp.MarshalAppend(respIpHeader)
+		if err != nil {
+			panic(err)
+		}
+		tcpRespPacket := respPacket[len(respIpHeader):]
+		dtcp.TCPSetChecksum(tcpRespPacket, dtcp.TCPChecksum(tcpRespPacket, packet.Header.Dst, packet.Header.Src))
+
+		log.Printf("Sending response to: %v", packet.Header.Src)
+		_, err = sendSock.WriteToIP(respPacket, &net.IPAddr{IP: packet.Header.Src})
+		log.Printf("TCP response error: %v", err)
 	}
 
 }
