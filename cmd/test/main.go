@@ -19,18 +19,9 @@ const (
 	errorRateDenom = 4
 )
 
-func doRead(r io.Reader) {
-	buf := make([]byte, 1024)
-
-	for {
-		n, err := r.Read(buf)
-		if n > 0 {
-			log.Printf("Read bytes: %v", buf[:n])
-		}
-		if err != nil {
-			panic(err)
-		}
-	}
+func doEcho(r io.Reader, w io.Writer) {
+	n, err := io.Copy(w, r)
+	log.Printf("io.Copy n: %d, err: %v", n, err)
 }
 
 func dropPacket() bool {
@@ -114,7 +105,7 @@ func main() {
 			tcpConn = dtcp.NewTCPConnState(tcpHeader)
 			connMap.PutState(packet.Header.Src, tcpHeader.SrcPort, tcpConn)
 
-			go doRead(tcpConn)
+			go doEcho(tcpConn, tcpConn)
 		} else {
 			log.Print("Existing TCP connection")
 			tcpConn = connMap.GetState(packet.Header.Src, tcpHeader.SrcPort)
