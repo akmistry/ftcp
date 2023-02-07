@@ -21,6 +21,8 @@ const (
 	tcpSeqHighMask = 0xFFFFFFFF00000000
 
 	tcpMinPacketSize = 20
+
+	oneGig = (1 << 30)
 )
 
 type TCPConnState struct {
@@ -129,6 +131,19 @@ func (s *TCPConnState) PendingResponse() bool {
 	return false
 }
 
+func isInWindow(x, windowStart, windowEnd uint32) bool {
+	// Window is half-open interval: [windowStart, windowEnd)
+	if windowEnd < windowStart {
+		// Window wraps around.
+		// [--------->end.......<start---------]
+		return x >= windowStart || x < windowEnd
+	}
+
+	// Non-wrap around window
+	// [.....<start------------->end.......]
+	return x >= windowStart && x < windowEnd
+}
+
 func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 	s.lock.Lock()
 	defer s.lock.Unlock()
@@ -192,23 +207,54 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 	if len(data) > 0 {
 		log.Printf("TCP pending data: %v", data)
 
-		// TODO: Handle out of order packets
 		recvEnd := s.recvStart + uint64(s.recvBuf.Len())
 		if hdr.SeqNum != uint32(recvEnd) {
-			log.Printf("Retransmission or out-of-order packet detected")
+			log.Printf("Seq: %d, revcStart: %d, recvEnd: %d", hdr.SeqNum, s.recvStart, recvEnd)
+
+			// Since the sequence number is 32-bit and wraps around, it's ambiguous
+			// whether the received packet is before or after our current window. So
+			// use a 1GiB threshold before and after the current receive end to
+			// determine where the packet lies.
+			offsetBefore := uint32(recvEnd) - hdr.SeqNum
+			offsetAfter := hdr.SeqNum - uint32(recvEnd)
+			log.Printf("offsetBefore: %d, offsetAfter: %d", offsetBefore, offsetAfter)
+
+			if offsetBefore < oneGig {
+				log.Printf("Data retransmission detected. offsetBefore: %d, len(data): %d",
+					offsetBefore, len(data))
+				// Drop all the data
+				if int(offsetBefore) < len(data) {
+					data = data[int(offsetBefore):]
+				} else {
+					data = nil
+				}
+				s.pendingAck = true
+			} else if offsetAfter < oneGig {
+				// TODO: Implement out-of-order packet handling.
+				log.Printf("Data after range, dropping (for now)...")
+				data = nil
+			} else {
+				log.Printf("Data outside range, dropping...")
+				data = nil
+			}
 		}
 
-		n, err := s.recvBuf.Write(data)
-		if err != nil && err != ringbuffer.ErrBufferFull {
-			return err
-		}
-
-		if n > 0 {
-			s.pendingAck = true
-			s.cond.Signal()
+		if len(data) > 0 {
+			n, err := s.recvBuf.Write(data)
+			if err != nil && err != ringbuffer.ErrBufferFull {
+				// Don't expect any error other than ErrBufferFull
+				panic(err)
+			}
+			if n > 0 {
+				s.pendingAck = true
+			}
 		}
 
 		log.Printf("TCP read buffer length: %d", s.recvBuf.Len())
+	}
+
+	if s.pendingAck {
+		s.cond.Signal()
 	}
 
 	return nil

@@ -3,6 +3,7 @@ package main
 import (
 	"io"
 	"log"
+	"math/rand"
 	"net"
 
 	"golang.org/x/net/ipv4"
@@ -13,6 +14,9 @@ import (
 
 const (
 	maxPacketSize = 1024
+
+	errorRateNum   = 1
+	errorRateDenom = 4
 )
 
 func doRead(r io.Reader) {
@@ -27,6 +31,11 @@ func doRead(r io.Reader) {
 			panic(err)
 		}
 	}
+}
+
+func dropPacket() bool {
+	n := rand.Intn(errorRateDenom)
+	return n < errorRateNum
 }
 
 func main() {
@@ -91,6 +100,11 @@ func main() {
 		log.Printf("Payload: %v", packet.Payload())
 		log.Printf("TCP header: %v", tcpHeader)
 
+		if dropPacket() {
+			log.Print("In packet dropped")
+			continue
+		}
+
 		var tcpConn *dtcp.TCPConnState
 		if tcpHeader.Syn {
 			log.Print("New TCP connection")
@@ -111,6 +125,11 @@ func main() {
 		err = tcpConn.ConsumePacket(tcpHeader, packet.Payload()[tcpHeader.DataOff:])
 		if err != nil {
 			log.Printf("tcpConn.ConsumePacket error: %v", err)
+			continue
+		}
+
+		if dropPacket() {
+			log.Print("Out packet dropped")
 			continue
 		}
 
