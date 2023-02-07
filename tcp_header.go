@@ -145,6 +145,11 @@ func (h *TCPHeader) String() string {
 		h.Timestamp, h.Checksum)
 }
 
+func (h *TCPHeader) MarshalSize() int {
+	// TODO: Support TCP options.
+	return 20
+}
+
 func (h *TCPHeader) MarshalAppend(buf []byte) ([]byte, error) {
 	var tcpHead [20]byte
 	be.PutUint16(tcpHead[0:2], h.SrcPort)

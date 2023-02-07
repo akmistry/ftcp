@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync"
 
 	"github.com/akmistry/go-util/ringbuffer"
 )
@@ -18,9 +19,13 @@ const (
 	tcpInitialWindowSize = 4096
 
 	tcpSeqHighMask = 0xFFFFFFFF00000000
+
+	tcpMinPacketSize = 20
 )
 
 type TCPConnState struct {
+	localPort, remotePort uint16
+
 	state tcpConnState
 
 	// TODO: Support SACK.
@@ -29,45 +34,92 @@ type TCPConnState struct {
 	sendWindowSize int
 	// Sequence number of first byte in the out buffer
 	sendStart uint64
-	// Sequence number of one past the last by in the out buffer.
-	// sendEnd - sendStart = # bytes in the out buffer
-	// (sendStart == sendEnd) => empty out buffer
-	sendEnd uint64
+	// Next sequence number to be sent (not already sent and awaiting ack)
+	sendSentSeq uint64
 
 	// Receive state
 	recvBuf    *ringbuffer.RingBuffer
 	recvStart  uint64
-	recvEnd    uint64
 	pendingAck bool
 
 	// Window size of the sender
 	senderWindowSize int
+
+	lock sync.Mutex
+	cond *sync.Cond
 }
 
-func NewTCPConnState() *TCPConnState {
+func NewTCPConnState(tcpSynHeader *TCPHeader) *TCPConnState {
 	s := &TCPConnState{
-		sendBuf: ringbuffer.NewRingBuffer(make([]byte, tcpInitialWindowSize)),
+		localPort:  tcpSynHeader.DstPort,
+		remotePort: tcpSynHeader.SrcPort,
+		sendBuf:    ringbuffer.NewRingBuffer(make([]byte, tcpInitialWindowSize)),
 		// TODO: Use a SYN cookie.
 		sendStart:      0,
-		sendEnd:        0,
+		sendSentSeq:    0,
 		sendWindowSize: tcpInitialWindowSize,
 		state:          tcpConnStateInit,
 	}
+	s.cond = sync.NewCond(&s.lock)
 	return s
 }
 
-func (s *TCPConnState) GenerateRespHeader() *TCPHeader {
-	h := &TCPHeader{
-		SeqNum:     uint32(s.sendStart),
-		AckNum:     uint32(s.recvEnd),
-		Ack:        true,
-		WindowSize: s.sendWindowSize,
+func (s *TCPConnState) makeReponseHeader() *TCPHeader {
+	return &TCPHeader{
+		SrcPort:    s.localPort,
+		DstPort:    s.remotePort,
+		WindowSize: s.recvBuf.Free(),
+
+		Ack:    true,
+		AckNum: uint32(s.recvStart + uint64(s.recvBuf.Len())),
+
+		SeqNum: uint32(s.sendSentSeq),
 	}
+}
+
+func (s *TCPConnState) MakePacket(buf []byte) (int, error) {
+	if len(buf) < tcpMinPacketSize {
+		panic("len(buf) < tcpMinPacketSize (20)")
+	}
+
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	hdr := s.makeReponseHeader()
+	if s.state == tcpConnStateSynRecv {
+		hdr.Syn = true
+	}
+	packetSize := hdr.MarshalSize()
+
+	sendEnd := s.sendStart + uint64(s.sendBuf.Len())
+	bufDataSize := len(buf) - packetSize
+	if sendEnd > s.sendSentSeq && bufDataSize > 0 {
+		// We have unsent data.
+		// TODO: Resend on ack timeout
+		dataBuf := buf[packetSize:]
+		sendOffset := int(s.sendSentSeq - s.sendStart)
+		pendingData := s.sendBuf.Peek(sendOffset)
+		n := copy(dataBuf, pendingData)
+
+		packetSize += n
+		s.sendSentSeq += uint64(n)
+	}
+
+	log.Printf("Response TCP packet: %v", hdr)
+	_, err := hdr.MarshalAppend(buf[:0])
+	if err != nil {
+		return 0, err
+	}
+
 	s.pendingAck = false
-	return h
+
+	return packetSize, nil
 }
 
 func (s *TCPConnState) PendingResponse() bool {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
 	if s.state == tcpConnStateSynRecv {
 		return true
 	}
@@ -78,6 +130,9 @@ func (s *TCPConnState) PendingResponse() bool {
 }
 
 func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
 	switch s.state {
 	case tcpConnStateInit:
 		if !hdr.Syn {
@@ -85,8 +140,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 		}
 
 		s.recvStart = uint64(hdr.SeqNum) + 1
-		s.recvEnd = uint64(hdr.SeqNum) + 1
-		s.recvBuf = ringbuffer.NewRingBuffer(make([]byte, hdr.WindowSize))
+		s.recvBuf = ringbuffer.NewRingBuffer(make([]byte, tcpInitialWindowSize))
 
 		s.state = tcpConnStateSynRecv
 		// No more packet processing
@@ -101,7 +155,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 			return fmt.Errorf("AckNum %d != expected %d", hdr.AckNum, expectedAck)
 		}
 		s.sendStart++
-		s.sendEnd++
+		s.sendSentSeq++
 
 		s.state = tcpConnStateEst
 		// Continue packet processing in case this packet has data
@@ -113,22 +167,21 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 	if hdr.Ack && hdr.AckNum != trucSendStart {
 		log.Printf("Received ack: %d, s.sendStart: %d", hdr.AckNum, s.sendStart)
 
-		trueAckNum := uint64(hdr.AckNum)
-		if hdr.AckNum > trucSendStart {
-			trueAckNum += (s.sendStart & tcpSeqHighMask)
-		} else {
-			trueAckNum += (s.sendEnd & tcpSeqHighMask)
+		trueAckNum := uint64(hdr.AckNum) + (s.sendStart & tcpSeqHighMask)
+		if hdr.AckNum < trucSendStart {
+			trueAckNum += (1 << 32)
 		}
+		sendEnd := s.sendStart + uint64(s.sendBuf.Len())
 		if trueAckNum < s.sendStart {
 			log.Printf("trueAckNum %d < s.sendStart %d", trueAckNum, s.sendStart)
 			return errors.New("bad ack num")
-		} else if trueAckNum > s.sendEnd {
-			log.Printf("trueAckNum %d > s.sendEnd %d", trueAckNum, s.sendEnd)
+		} else if trueAckNum > sendEnd {
+			log.Printf("trueAckNum %d > sendEnd %d", trueAckNum, sendEnd)
 			return errors.New("bad ack num")
 		}
 		ackDiff := trueAckNum - s.sendStart
-		if ackDiff > uint64(s.sendBuf.Used()) {
-			log.Panicf("ackDiff %d > len(sendBuf) %d", ackDiff, s.sendBuf.Used())
+		if ackDiff > uint64(s.sendBuf.Len()) {
+			log.Panicf("ackDiff %d > len(sendBuf) %d", ackDiff, s.sendBuf.Len())
 		}
 
 		s.sendBuf.Consume(int(ackDiff))
@@ -139,9 +192,10 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 	if len(data) > 0 {
 		log.Printf("TCP pending data: %v", data)
 
-		// TODO: Handle retransmissions.
-		if hdr.SeqNum != uint32(s.recvEnd) {
-			log.Printf("Retransmission detected")
+		// TODO: Handle out of order packets
+		recvEnd := s.recvStart + uint64(s.recvBuf.Len())
+		if hdr.SeqNum != uint32(recvEnd) {
+			log.Printf("Retransmission or out-of-order packet detected")
 		}
 
 		n, err := s.recvBuf.Write(data)
@@ -149,11 +203,54 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 			return err
 		}
 
-		s.recvEnd += uint64(n)
-		s.pendingAck = true
+		if n > 0 {
+			s.pendingAck = true
+			s.cond.Signal()
+		}
 
 		log.Printf("TCP read buffer length: %d", s.recvBuf.Len())
 	}
 
 	return nil
+}
+
+func (s *TCPConnState) Read(b []byte) (int, error) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	for s.recvBuf == nil || s.recvBuf.Len() == 0 {
+		s.cond.Wait()
+	}
+
+	readBuf := s.recvBuf.Peek(0)
+	if len(readBuf) == 0 {
+		log.Printf("s.recvBuf.Len(): %d", s.recvBuf.Len())
+		panic("len(readBuf) == 0")
+	}
+	n := copy(b, readBuf)
+	s.recvBuf.Consume(n)
+	s.recvStart += uint64(n)
+	return n, nil
+}
+
+func (s *TCPConnState) Write(b []byte) (int, error) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	written := 0
+	for len(b) > 0 {
+		for s.sendBuf.Free() == 0 {
+			// TODO: Check for connection close.
+			s.cond.Wait()
+		}
+
+		n, err := s.sendBuf.Write(b)
+		written += n
+		b = b[n:]
+		if err != nil && err != ringbuffer.ErrBufferFull {
+			return written, err
+		}
+	}
+
+	return written, nil
 }
