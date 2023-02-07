@@ -39,6 +39,8 @@ func dropPacket() bool {
 }
 
 func main() {
+	dtcp.SetLogLevel(dtcp.LOG_DEBUG)
+
 	ipAddr := net.IPv4(192, 168, 1, 134)
 	listenPort := uint16(9999)
 

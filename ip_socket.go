@@ -2,7 +2,6 @@ package dtcp
 
 import (
 	"io"
-	"log"
 	"net"
 	"os"
 
@@ -60,7 +59,7 @@ func OpenRawSocket() (io.ReadWriteCloser, error) {
 	*/
 	ifc, err := net.InterfaceByName("eno1")
 	if err != nil {
-		log.Printf("Interface error: %v", err)
+		LogError("Interface error: %v", err)
 		return nil, err
 	}
 	sa := &unix.SockaddrLinklayer{
@@ -69,7 +68,7 @@ func OpenRawSocket() (io.ReadWriteCloser, error) {
 	}
 	err = unix.Bind(fd, sa)
 	if err != nil {
-		log.Printf("Bind error: %v", err)
+		LogError("Bind error: %v", err)
 		return nil, err
 	}
 

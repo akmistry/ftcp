@@ -3,8 +3,8 @@ package dtcp
 import (
 	"errors"
 	"fmt"
-	"log"
 	"sync"
+	"time"
 
 	"github.com/akmistry/go-util/ringbuffer"
 )
@@ -22,7 +22,10 @@ const (
 
 	tcpMinPacketSize = 20
 
-	oneGig = (1 << 30)
+	// Use a static 1 second retransmission timeout
+	tcpRto = time.Second
+
+	gigabyte = (1 << 30)
 )
 
 type TCPConnState struct {
@@ -32,20 +35,17 @@ type TCPConnState struct {
 
 	// TODO: Support SACK.
 	// Send state
-	sendBuf        *ringbuffer.RingBuffer
-	sendWindowSize int
+	sendBuf *ringbuffer.RingBuffer
 	// Sequence number of first byte in the out buffer
 	sendStart uint64
 	// Next sequence number to be sent (not already sent and awaiting ack)
-	sendSentSeq uint64
+	sendNextSeq uint64
 
 	// Receive state
-	recvBuf    *ringbuffer.RingBuffer
-	recvStart  uint64
-	pendingAck bool
-
-	// Window size of the sender
-	senderWindowSize int
+	recvBuf        *ringbuffer.RingBuffer
+	recvWindowSize int
+	recvStart      uint64
+	pendingAck     bool
 
 	lock sync.Mutex
 	cond *sync.Cond
@@ -57,10 +57,9 @@ func NewTCPConnState(tcpSynHeader *TCPHeader) *TCPConnState {
 		remotePort: tcpSynHeader.SrcPort,
 		sendBuf:    ringbuffer.NewRingBuffer(make([]byte, tcpInitialWindowSize)),
 		// TODO: Use a SYN cookie.
-		sendStart:      0,
-		sendSentSeq:    0,
-		sendWindowSize: tcpInitialWindowSize,
-		state:          tcpConnStateInit,
+		sendStart:   0,
+		sendNextSeq: 0,
+		state:       tcpConnStateInit,
 	}
 	s.cond = sync.NewCond(&s.lock)
 	return s
@@ -75,7 +74,7 @@ func (s *TCPConnState) makeReponseHeader() *TCPHeader {
 		Ack:    true,
 		AckNum: uint32(s.recvStart + uint64(s.recvBuf.Len())),
 
-		SeqNum: uint32(s.sendSentSeq),
+		SeqNum: uint32(s.sendNextSeq),
 	}
 }
 
@@ -91,29 +90,28 @@ func (s *TCPConnState) MakePacket(buf []byte) (int, error) {
 	if s.state == tcpConnStateSynRecv {
 		hdr.Syn = true
 	}
-	packetSize := hdr.MarshalSize()
+	headerSize, err := hdr.MarshalInto(buf)
+	if err != nil {
+		return 0, err
+	}
+	packetSize := headerSize
+	s.pendingAck = false
 
 	sendEnd := s.sendStart + uint64(s.sendBuf.Len())
-	bufDataSize := len(buf) - packetSize
-	if sendEnd > s.sendSentSeq && bufDataSize > 0 {
+	bufDataSize := len(buf) - headerSize
+	if sendEnd > s.sendNextSeq && bufDataSize > 0 {
 		// We have unsent data.
 		// TODO: Resend on ack timeout
-		dataBuf := buf[packetSize:]
-		sendOffset := int(s.sendSentSeq - s.sendStart)
+		dataBuf := buf[headerSize:]
+		sendOffset := int(s.sendNextSeq - s.sendStart)
 		pendingData := s.sendBuf.Peek(sendOffset)
 		n := copy(dataBuf, pendingData)
 
 		packetSize += n
-		s.sendSentSeq += uint64(n)
+		s.sendNextSeq += uint64(n)
 	}
 
-	log.Printf("Response TCP packet: %v", hdr)
-	_, err := hdr.MarshalAppend(buf[:0])
-	if err != nil {
-		return 0, err
-	}
-
-	s.pendingAck = false
+	LogDebug("Response TCP packet: %v", hdr)
 
 	return packetSize, nil
 }
@@ -122,10 +120,10 @@ func (s *TCPConnState) PendingResponse() bool {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
-	if s.state == tcpConnStateSynRecv {
-		return true
-	}
 	if s.pendingAck {
+		return true
+	} else if s.sendNextSeq < (s.sendStart + uint64(s.sendBuf.Len())) {
+		// Data waiting to be sent.
 		return true
 	}
 	return false
@@ -156,8 +154,10 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 
 		s.recvStart = uint64(hdr.SeqNum) + 1
 		s.recvBuf = ringbuffer.NewRingBuffer(make([]byte, tcpInitialWindowSize))
+		s.recvWindowSize = hdr.WindowSize
 
 		s.state = tcpConnStateSynRecv
+		s.pendingAck = true
 		// No more packet processing
 		return nil
 	case tcpConnStateSynRecv:
@@ -170,7 +170,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 			return fmt.Errorf("AckNum %d != expected %d", hdr.AckNum, expectedAck)
 		}
 		s.sendStart++
-		s.sendSentSeq++
+		s.sendNextSeq++
 
 		s.state = tcpConnStateEst
 		// Continue packet processing in case this packet has data
@@ -180,7 +180,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 	// First, look at any ACKs.
 	trucSendStart := uint32(s.sendStart)
 	if hdr.Ack && hdr.AckNum != trucSendStart {
-		log.Printf("Received ack: %d, s.sendStart: %d", hdr.AckNum, s.sendStart)
+		LogDebug("Received ack: %d, s.sendStart: %d", hdr.AckNum, s.sendStart)
 
 		trueAckNum := uint64(hdr.AckNum) + (s.sendStart & tcpSeqHighMask)
 		if hdr.AckNum < trucSendStart {
@@ -188,15 +188,15 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 		}
 		sendEnd := s.sendStart + uint64(s.sendBuf.Len())
 		if trueAckNum < s.sendStart {
-			log.Printf("trueAckNum %d < s.sendStart %d", trueAckNum, s.sendStart)
+			LogWarn("trueAckNum %d < s.sendStart %d", trueAckNum, s.sendStart)
 			return errors.New("bad ack num")
 		} else if trueAckNum > sendEnd {
-			log.Printf("trueAckNum %d > sendEnd %d", trueAckNum, sendEnd)
+			LogWarn("trueAckNum %d > sendEnd %d", trueAckNum, sendEnd)
 			return errors.New("bad ack num")
 		}
 		ackDiff := trueAckNum - s.sendStart
 		if ackDiff > uint64(s.sendBuf.Len()) {
-			log.Panicf("ackDiff %d > len(sendBuf) %d", ackDiff, s.sendBuf.Len())
+			LogFatal("ackDiff %d > len(sendBuf) %d", ackDiff, s.sendBuf.Len())
 		}
 
 		s.sendBuf.Consume(int(ackDiff))
@@ -205,11 +205,11 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 
 	// Process any incoming data.
 	if len(data) > 0 {
-		log.Printf("TCP pending data: %v", data)
+		LogDebug("TCP pending data: %v", data)
 
 		recvEnd := s.recvStart + uint64(s.recvBuf.Len())
 		if hdr.SeqNum != uint32(recvEnd) {
-			log.Printf("Seq: %d, revcStart: %d, recvEnd: %d", hdr.SeqNum, s.recvStart, recvEnd)
+			LogDebug("Seq: %d, revcStart: %d, recvEnd: %d", hdr.SeqNum, s.recvStart, recvEnd)
 
 			// Since the sequence number is 32-bit and wraps around, it's ambiguous
 			// whether the received packet is before or after our current window. So
@@ -217,10 +217,10 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 			// determine where the packet lies.
 			offsetBefore := uint32(recvEnd) - hdr.SeqNum
 			offsetAfter := hdr.SeqNum - uint32(recvEnd)
-			log.Printf("offsetBefore: %d, offsetAfter: %d", offsetBefore, offsetAfter)
+			LogDebug("offsetBefore: %d, offsetAfter: %d", offsetBefore, offsetAfter)
 
-			if offsetBefore < oneGig {
-				log.Printf("Data retransmission detected. offsetBefore: %d, len(data): %d",
+			if offsetBefore < gigabyte {
+				LogInfo("Data retransmission detected. offsetBefore: %d, len(data): %d",
 					offsetBefore, len(data))
 				// Drop all the data
 				if int(offsetBefore) < len(data) {
@@ -229,12 +229,12 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 					data = nil
 				}
 				s.pendingAck = true
-			} else if offsetAfter < oneGig {
+			} else if offsetAfter < gigabyte {
 				// TODO: Implement out-of-order packet handling.
-				log.Printf("Data after range, dropping (for now)...")
+				LogWarn("Out of order packet detected, dropping (unimplemented for now)...")
 				data = nil
 			} else {
-				log.Printf("Data outside range, dropping...")
+				LogWarn("Data outside range, dropping...")
 				data = nil
 			}
 		}
@@ -250,7 +250,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 			}
 		}
 
-		log.Printf("TCP read buffer length: %d", s.recvBuf.Len())
+		LogDebug("TCP read buffer length: %d", s.recvBuf.Len())
 	}
 
 	if s.pendingAck {
@@ -270,7 +270,6 @@ func (s *TCPConnState) Read(b []byte) (int, error) {
 
 	readBuf := s.recvBuf.Peek(0)
 	if len(readBuf) == 0 {
-		log.Printf("s.recvBuf.Len(): %d", s.recvBuf.Len())
 		panic("len(readBuf) == 0")
 	}
 	n := copy(b, readBuf)

@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 )
 
@@ -27,6 +26,8 @@ const (
 	TcpOptionSackPermitted = 4
 	TcpOptionSack          = 5
 	TcpOptionTimestamp     = 8
+
+	TcpMinHeaderSize = 20
 )
 
 func isFlag(v, f byte) bool {
@@ -72,7 +73,7 @@ type TCPHeader struct {
 }
 
 func ParseTCPHeader(buf []byte) (*TCPHeader, error) {
-	if len(buf) < 20 {
+	if len(buf) < TcpMinHeaderSize {
 		return nil, errTcpBufTooSmall
 	}
 
@@ -97,7 +98,7 @@ func ParseTCPHeader(buf []byte) (*TCPHeader, error) {
 			len(buf), header.DataOff/4, header.DataOff)
 	}
 
-	opts := buf[20:header.DataOff]
+	opts := buf[TcpMinHeaderSize:header.DataOff]
 	for off := 0; off < len(opts); {
 		optionKind := opts[off]
 		if optionKind == 0 {
@@ -116,7 +117,7 @@ func ParseTCPHeader(buf []byte) (*TCPHeader, error) {
 		case TcpOptionSack:
 		case TcpOptionTimestamp:
 			if optionLen != 10 {
-				log.Printf("Invalid TCP timestamp length: %d", optionLen)
+				LogWarn("Invalid TCP timestamp length: %d", optionLen)
 				break
 			}
 			header.Timestamp = &TCPTimestamp{
@@ -124,7 +125,7 @@ func ParseTCPHeader(buf []byte) (*TCPHeader, error) {
 				EchoReply: be.Uint32(opts[off+6 : off+10]),
 			}
 		default:
-			log.Printf("Unrecognised TCP option %d", optionKind)
+			LogWarn("Unrecognised TCP option %d", optionKind)
 		}
 		off += int(optionLen)
 	}
@@ -147,28 +148,34 @@ func (h *TCPHeader) String() string {
 
 func (h *TCPHeader) MarshalSize() int {
 	// TODO: Support TCP options.
-	return 20
+	return TcpMinHeaderSize
 }
 
-func (h *TCPHeader) MarshalAppend(buf []byte) ([]byte, error) {
-	var tcpHead [20]byte
-	be.PutUint16(tcpHead[0:2], h.SrcPort)
-	be.PutUint16(tcpHead[2:4], h.DstPort)
-	be.PutUint32(tcpHead[4:8], h.SeqNum)
-	be.PutUint32(tcpHead[8:12], h.AckNum)
-	tcpHead[12] = (20 /* TODO: Replace with header size including options */ / 4) << 4
+func (h *TCPHeader) MarshalInto(buf []byte) (int, error) {
+	if len(buf) < TcpMinHeaderSize {
+		return 0, errTcpBufTooSmall
+	}
+
+	be.PutUint16(buf[0:2], h.SrcPort)
+	be.PutUint16(buf[2:4], h.DstPort)
+	be.PutUint32(buf[4:8], h.SeqNum)
+	be.PutUint32(buf[8:12], h.AckNum)
+	buf[12] = (20 /* TODO: Replace with header size including options */ / 4) << 4
 	flags := toFlag(h.Fin, tcpFlagFin) |
 		toFlag(h.Syn, tcpFlagSyn) |
 		toFlag(h.Rst, tcpFlagRst) |
 		toFlag(h.Psh, tcpFlagPsh) |
 		toFlag(h.Ack, tcpFlagAck) |
 		toFlag(h.Urg, tcpFlagUrg)
-	tcpHead[13] = flags
+	buf[13] = flags
 	// TODO: Support window scaling
-	be.PutUint16(tcpHead[14:16], uint16(h.WindowSize))
-	// UrgentPointer = 0
+	be.PutUint16(buf[14:16], uint16(h.WindowSize))
+	// Checksum
+	be.PutUint16(buf[16:18], 0)
+	// UrgentPointer
+	be.PutUint16(buf[18:20], 0)
 
-	return append(buf, tcpHead[:]...), nil
+	return TcpMinHeaderSize, nil
 }
 
 type tcpChecksum struct {
