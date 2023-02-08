@@ -61,11 +61,15 @@ type TCPConnState struct {
 	// Receive state
 	recvBuf    *SyncedBuffer
 	recvClosed bool
-	pendingAck bool
 
+	// Last ACK receive time, for the retransmission timeout
 	lastAckTime time.Time
 
+	// There is a pending outgoing packet
+	pendingSend bool
+
 	lock sync.Mutex
+	// TODO: Seperate condvars for send and receive buffers
 	cond *sync.Cond
 }
 
@@ -94,7 +98,7 @@ func (s *TCPConnState) retransmitTimeout() {
 		now := time.Now()
 		s.lock.Lock()
 
-		if now.Sub(s.lastAckTime) > tcpRto {
+		if now.Sub(s.lastAckTime) > tcpRto && s.sendBuf.Len() > 0 {
 			LogDebug("Retransmission timeout!!!")
 			s.sendBuf.ResetNextSeq()
 			go s.sendNextPacket()
@@ -120,7 +124,7 @@ func (s *TCPConnState) sendNextPacket() {
 	defer s.lock.Unlock()
 
 	pendingPacket := false
-	if s.pendingAck {
+	if s.pendingSend {
 		pendingPacket = true
 	} else if s.sendBuf.HasUnsentData() {
 		// Data waiting to be sent.
@@ -156,7 +160,7 @@ func (s *TCPConnState) sendNextPacket() {
 		panic(err)
 	}
 	packetSize := headerSize
-	s.pendingAck = false
+	s.pendingSend = false
 
 	bufDataSize := len(buf) - headerSize
 	if bufDataSize > 0 && s.sendBuf.HasUnsentData() {
@@ -209,7 +213,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 		s.recvBuf = NewSyncedBuffer(hdr.SeqNum+1, tcpInitialWindowSize)
 
 		s.state = tcpConnStateSynRecv
-		s.pendingAck = true
+		s.pendingSend = true
 		go s.sendNextPacket()
 		// No more packet processing
 		return nil
@@ -233,7 +237,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 			if hdr.SeqNum == recvEnd {
 				s.state = tcpConnStateCloseWait
 				s.recvClosed = true
-				s.pendingAck = true
+				s.pendingSend = true
 			}
 		}
 
@@ -257,8 +261,8 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 		LogDebug("BEFORE: Received ack: %d, s.sendStart: %d, sendEnd: %d",
 			hdr.AckNum, s.sendBuf.StartSeq(), s.sendBuf.EndSeq())
 		if s.sendBuf.Ack(hdr.AckNum) {
-			// Data has been ACK'd, so inform writers since there is now
-			// space in the send buffer.
+			// Data has been ACK'd, so inform writers there is now space in the send
+			// buffer.
 			s.cond.Broadcast()
 
 			s.lastAckTime = time.Now()
@@ -293,7 +297,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 				} else {
 					data = nil
 				}
-				s.pendingAck = true
+				s.pendingSend = true
 			} else if offsetAfter < gigabyte {
 				// TODO: Implement out-of-order packet handling.
 				LogWarn("Out of order packet detected, dropping (unimplemented for now)...")
@@ -309,20 +313,21 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 		if len(data) > 0 {
 			n := s.recvBuf.Append(data)
 			if n > 0 {
-				s.pendingAck = true
+				// New data in the receive buffer, signal any waiting readers.
+				s.cond.Broadcast()
+				// Send an ACK.
+				s.pendingSend = true
 			}
-			s.cond.Broadcast()
 		}
 
 		LogDebug("TCP read buffer length: %d, free: %d", s.recvBuf.Len(), s.recvBuf.Free())
 	}
 
 	if s.sendClosed && (s.sendBuf.Len() == 0) {
-		s.pendingAck = true
+		s.pendingSend = true
 	}
 
-	if s.pendingAck {
-		s.cond.Broadcast()
+	if s.pendingSend {
 		go s.sendNextPacket()
 	}
 
@@ -345,7 +350,7 @@ func (s *TCPConnState) Read(b []byte) (int, error) {
 	if s.recvBuf.Free() == 0 && n > 0 {
 		// We're about free up some space in the receive buffer, so let the remote
 		// end know.
-		s.pendingAck = true
+		s.pendingSend = true
 		go s.sendNextPacket()
 	}
 	s.recvBuf.Consume(n)
@@ -388,8 +393,10 @@ func (s *TCPConnState) Close() error {
 		// Already closed
 		return nil
 	}
+
 	s.sendClosed = true
-	s.pendingAck = true
+	// Potentially send FIN if there is no data in the send buffer.
+	s.pendingSend = true
 	s.cond.Broadcast()
 	go s.sendNextPacket()
 	return nil
