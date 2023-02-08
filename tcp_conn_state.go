@@ -137,6 +137,7 @@ func (s *TCPConnState) sendNextPacket() {
 		if s.state == tcpConnStateCloseWait {
 			s.state = tcpConnStateLastAck
 			s.sendStart++
+			s.sendNextSeq++
 		}
 		// TODO: Handle other states.
 	}
@@ -226,9 +227,15 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 
 	case tcpConnStateLastAck:
 		if hdr.Ack && hdr.AckNum == uint32(s.sendStart) {
+			s.state = tcpConnStateClosed
 			LogDebug("TCP CONNECTION FULLY CLOSED!!!")
 			// TODO: Do something!
+			return nil
 		}
+
+	case tcpConnStateClosed:
+		// No nothing.
+		return nil
 	}
 
 	// First, look at any ACKs.
@@ -314,6 +321,10 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 		LogDebug("TCP read buffer length: %d", s.recvBuf.Len())
 	}
 
+	if s.sendClosed && (s.sendBuf.Len() == 0) {
+		s.pendingAck = true
+	}
+
 	if s.pendingAck {
 		s.cond.Broadcast()
 		go s.sendNextPacket()
@@ -391,5 +402,6 @@ func (s *TCPConnState) Close() error {
 	}
 	s.sendClosed = true
 	s.cond.Broadcast()
+	go s.sendNextPacket()
 	return nil
 }
