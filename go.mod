@@ -1,4 +1,4 @@
-module github.com/akmistry/dtcp
+module github.com/akmistry/ftcp
 
 go 1.19
 

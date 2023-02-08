@@ -8,7 +8,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/akmistry/dtcp"
+	"github.com/akmistry/ftcp"
 )
 
 const (
@@ -35,29 +35,37 @@ type socketAdapter struct {
 }
 
 func (a *socketAdapter) ReadFromIP(b []byte) (int, *net.IPAddr, error) {
-	n, err := a.rawSock.Read(b)
-	return n, nil, err
+	for {
+		n, err := a.rawSock.Read(b)
+		if dropPacket() {
+			continue
+		}
+		return n, nil, err
+	}
 }
 
 func (a *socketAdapter) WriteToIP(b []byte, addr *net.IPAddr) (int, error) {
+	if dropPacket() {
+		return len(b), nil
+	}
 	return a.ipSendSock.WriteToIP(b, addr)
 }
 
 func main() {
-	dtcp.SetLogLevel(dtcp.LOG_DEBUG)
+	ftcp.SetLogLevel(ftcp.LOG_INFO)
 
 	ipAddr := net.IPv4(192, 168, 1, 134)
 
 	//listenIpAddr := net.IPv4(0, 0, 0, 0)
 	//listenIpAddr := ipAddr
-	//sock, err := dtcp.OpenIPSocket(listenIpAddr)
-	sock, err := dtcp.OpenRawSocket()
+	//sock, err := ftcp.OpenIPSocket(listenIpAddr)
+	sock, err := ftcp.OpenRawSocket()
 	if err != nil {
 		panic(err)
 	}
 	log.Print("RAW socket opened")
 
-	sendSock, err := dtcp.OpenIPSocket(net.IPv4(0, 0, 0, 0))
+	sendSock, err := ftcp.OpenIPSocket(net.IPv4(0, 0, 0, 0))
 	if err != nil {
 		panic(err)
 	}
@@ -69,8 +77,8 @@ func main() {
 	localAddr := &net.IPAddr{
 		IP: ipAddr,
 	}
-	ipStack := dtcp.NewIPStack(adapter, localAddr)
-	tcpStack := dtcp.NewTCPStack(ipStack, localAddr)
+	ipStack := ftcp.NewIPStack(adapter, localAddr)
+	tcpStack := ftcp.NewTCPStack(ipStack, localAddr)
 	ipStack.RegisterProtocolHandler(unix.IPPROTO_TCP, tcpStack)
 	go func() {
 		for {

@@ -1,8 +1,6 @@
 github.com/AndreasBriese/bbloom v0.0.0-20190825152654-46b345b51c96/go.mod h1:bOvUY6CB00SOBii9/FifXqc0awNKxLFCL/+pkDPuyl8=
 github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
 github.com/OneOfOne/xxhash v1.2.2/go.mod h1:HSdplMjZKSmBqAxg5vPj2TmRDmfkzw+cTzAElWljhcU=
-github.com/akmistry/go-util v0.0.0-20230207035842-d487427ea98f h1:oTcBNY3kE6MWR8mG3VFeUtJabwWgbMaCHeE237+ta/M=
-github.com/akmistry/go-util v0.0.0-20230207035842-d487427ea98f/go.mod h1:OmP+aPvvCEAI0oI0+17/bYn1Yo5xfF71nUxHEb/rw1c=
 github.com/akmistry/go-util v0.0.0-20230207211237-86da025f013a h1:Jn2tD+BmFb3TJ7lynHufqiYgNAiluyWgrLoIJPIBVp8=
 github.com/akmistry/go-util v0.0.0-20230207211237-86da025f013a/go.mod h1:LeT7E9FYhzdImhArEEZtiJHsFxvVonCezQ1Tu0Ok3CI=
 github.com/armon/consul-api v0.0.0-20180202201655-eb2c6b5be1b6/go.mod h1:grANhF5doyWs3UAsr3K4I6qtAmlQcZDesFNEHPZAzj8=

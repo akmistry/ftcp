@@ -1,4 +1,4 @@
-package dtcp
+package ftcp
 
 import (
 	"encoding/binary"
