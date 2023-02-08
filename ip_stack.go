@@ -72,6 +72,14 @@ func (s *IPStack) Run() error {
 			continue
 		}
 
+		// Verify IP checksum
+		calcIpChecksum := IPChecksum(readPacket[:ipPacket.Header.Len])
+		if uint16(ipPacket.Header.Checksum) != calcIpChecksum {
+			LogWarn("IP checksum 0x%04x != calculated checksum 0x%04x",
+				ipPacket.Header.Checksum, calcIpChecksum)
+			continue
+		}
+
 		s.lock.Lock()
 		handler := s.protoHandlers[ipPacket.Header.Protocol]
 		s.lock.Unlock()
