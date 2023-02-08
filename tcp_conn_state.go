@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"sync"
 	"time"
 
@@ -48,7 +49,9 @@ const (
 )
 
 type TCPConnState struct {
+	sender                TCPSender
 	localPort, remotePort uint16
+	remoteAddr            *net.IPAddr
 
 	state tcpConnState
 
@@ -72,10 +75,12 @@ type TCPConnState struct {
 	cond *sync.Cond
 }
 
-func NewTCPConnState(tcpSynHeader *TCPHeader) *TCPConnState {
+func NewTCPConnState(tcpSynHeader *TCPHeader, sender TCPSender, remoteAddr *net.IPAddr) *TCPConnState {
 	s := &TCPConnState{
+		sender:     sender,
 		localPort:  tcpSynHeader.DstPort,
 		remotePort: tcpSynHeader.SrcPort,
+		remoteAddr: remoteAddr,
 		sendBuf:    ringbuffer.NewRingBuffer(make([]byte, tcpInitialWindowSize)),
 		// TODO: Use a SYN cookie.
 		sendStart:   0,
@@ -86,7 +91,7 @@ func NewTCPConnState(tcpSynHeader *TCPHeader) *TCPConnState {
 	return s
 }
 
-func (s *TCPConnState) makeReponseHeader() *TCPHeader {
+func (s *TCPConnState) makeHeader() *TCPHeader {
 	return &TCPHeader{
 		SrcPort:    s.localPort,
 		DstPort:    s.remotePort,
@@ -99,15 +104,27 @@ func (s *TCPConnState) makeReponseHeader() *TCPHeader {
 	}
 }
 
-func (s *TCPConnState) MakePacket(buf []byte) (int, error) {
-	if len(buf) < tcpMinPacketSize {
-		panic("len(buf) < tcpMinPacketSize (20)")
-	}
-
+func (s *TCPConnState) sendNextPacket() {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
-	hdr := s.makeReponseHeader()
+	pendingPacket := false
+	if s.pendingAck {
+		pendingPacket = true
+	} else if s.sendNextSeq < (s.sendStart + uint64(s.sendBuf.Len())) {
+		// Data waiting to be sent.
+		pendingPacket = true
+		//} else if s.state == tcpConnStateClosing && (s.sendBuf.Len() == 0) {
+		// Send final FIN packet.
+		//	return true
+	}
+	if !pendingPacket {
+		return
+	}
+
+	buf := make([]byte, 1024)
+
+	hdr := s.makeHeader()
 	if s.state == tcpConnStateSynRecv {
 		hdr.Syn = true
 	} else if s.state == tcpConnStateCloseWait {
@@ -125,7 +142,7 @@ func (s *TCPConnState) MakePacket(buf []byte) (int, error) {
 	}
 	headerSize, err := hdr.MarshalInto(buf)
 	if err != nil {
-		return 0, err
+		panic(err)
 	}
 	packetSize := headerSize
 	s.pendingAck = false
@@ -146,23 +163,10 @@ func (s *TCPConnState) MakePacket(buf []byte) (int, error) {
 
 	LogDebug("Response TCP packet: %v", hdr)
 
-	return packetSize, nil
-}
-
-func (s *TCPConnState) PendingResponse() bool {
-	s.lock.Lock()
-	defer s.lock.Unlock()
-
-	if s.pendingAck {
-		return true
-	} else if s.sendNextSeq < (s.sendStart + uint64(s.sendBuf.Len())) {
-		// Data waiting to be sent.
-		return true
-		//} else if s.state == tcpConnStateClosing && (s.sendBuf.Len() == 0) {
-		// Send final FIN packet.
-		//	return true
+	err = s.sender.SendTCPPacket(buf[:packetSize], s.remoteAddr, s.remotePort)
+	if err != nil {
+		LogWarn("Error sending TCP packet: %v", err)
 	}
-	return false
 }
 
 func isInWindow(x, windowStart, windowEnd uint32) bool {
@@ -194,6 +198,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 
 		s.state = tcpConnStateSynRecv
 		s.pendingAck = true
+		go s.sendNextPacket()
 		// No more packet processing
 		return nil
 	case tcpConnStateSynRecv:
@@ -311,6 +316,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 
 	if s.pendingAck {
 		s.cond.Broadcast()
+		go s.sendNextPacket()
 	}
 
 	return nil
@@ -334,6 +340,12 @@ func (s *TCPConnState) Read(b []byte) (int, error) {
 		panic("len(readBuf) == 0")
 	}
 	n := copy(b, readBuf)
+
+	if s.recvBuf.Free() == 0 && n > 0 {
+		// We're about free up some space in the receive buffer, so let the remote
+		// end know.
+		go s.sendNextPacket()
+	}
 	s.recvBuf.Consume(n)
 	s.recvStart += uint64(n)
 	return n, nil
@@ -363,6 +375,7 @@ func (s *TCPConnState) Write(b []byte) (int, error) {
 			// This should never happen.
 			panic(err)
 		}
+		go s.sendNextPacket()
 	}
 
 	return written, nil
