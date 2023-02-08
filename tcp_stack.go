@@ -6,6 +6,10 @@ import (
 	"net"
 )
 
+var (
+	errTcpChecksum = errors.New("tcp_stack: invalid checksum")
+)
+
 type TCPSender interface {
 	SendTCPPacket(b []byte, addr *net.IPAddr, port uint16) error
 }
@@ -32,7 +36,8 @@ func (s *TCPStack) HandleIPPacket(packet *IPPacket) error {
 	// TODO: Handle multiple listeners
 	listenPort := uint16(9999)
 
-	tcpHeader, err := ParseTCPHeader(packet.Payload())
+	tcpPacket := packet.Payload()
+	tcpHeader, err := ParseTCPHeader(tcpPacket)
 	if err != nil {
 		return err
 	}
@@ -42,14 +47,15 @@ func (s *TCPStack) HandleIPPacket(packet *IPPacket) error {
 		// Not the port we're listening on
 		return nil
 	}
-	LogDebug("Received TCP packet: %v", tcpHeader)
+	tcpData := tcpPacket[tcpHeader.DataOff:]
+	LogDebug("Received TCP packet with %d bytes data: %v", len(tcpData), tcpHeader)
 
 	// Verify TCP checksum
-	calcTcpChecksum := TCPChecksum(packet.Payload(), packet.Header.Src, packet.Header.Dst)
+	calcTcpChecksum := TCPChecksum(tcpPacket, packet.Header.Src, packet.Header.Dst)
 	if tcpHeader.Checksum != calcTcpChecksum {
 		LogWarn("TCP checksum 0x%04x != calculated checksum 0x%04x",
 			tcpHeader.Checksum, calcTcpChecksum)
-		return errors.New("tcp_stack: invalid checksum")
+		return errTcpChecksum
 	}
 
 	// TODO: Support the full 4-tuple for connection identity
