@@ -33,9 +33,6 @@ const (
 	// TODO: Increase this
 	tcpInitialWindowSize = 4096
 
-	// Mask of high-order 4-byte of the tracked 64-bit sequence numbers
-	tcpSeqHighMask = 0xFFFFFFFF00000000
-
 	// Minimum size of a TCP packet (minimum header size)
 	tcpMinPacketSize = TcpMinHeaderSize
 
@@ -165,7 +162,6 @@ func (s *TCPConnState) sendNextPacket() {
 	bufDataSize := len(buf) - headerSize
 	if bufDataSize > 0 && s.sendBuf.HasUnsentData() {
 		// We have unsent data.
-		// TODO: Resend on ack timeout
 		dataBuf := buf[headerSize:]
 		sendOffset := int(s.sendBuf.NextSendSeq() - s.sendBuf.StartSeq())
 		n := s.sendBuf.Fetch(dataBuf, sendOffset)
@@ -303,10 +299,11 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 				LogWarn("Out of order packet detected, dropping (unimplemented for now)...")
 				data = nil
 			} else {
-				// TODO: According to RFC 9293 3.5.3 group 3, this must be responsed to
-				// with an empty ACK.
 				LogWarn("Data outside range, dropping...")
 				data = nil
+				// TODO: According to RFC 9293 3.5.2 group 3, this must be responded to
+				// with an __empty__ ACK.
+				s.pendingSend = true
 			}
 		}
 
