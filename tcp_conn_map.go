@@ -2,11 +2,12 @@ package ftcp
 
 import (
 	"net"
+	"net/netip"
 	"sync"
 )
 
 type tcpConnKey struct {
-	IP   [4]byte
+	Addr netip.Addr
 	Port uint16
 }
 
@@ -22,14 +23,14 @@ func MakeTCPConnMap() *TCPConnMap {
 }
 
 func makeTcpConnKey(ip net.IP, port uint16) (tcpConnKey, bool) {
-	ip4 := ip.To4()
-	if ip4 == nil {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
 		return tcpConnKey{}, false
 	}
 	key := tcpConnKey{
+		Addr: addr,
 		Port: port,
 	}
-	copy(key.IP[:], ip4)
 	return key, true
 }
 
