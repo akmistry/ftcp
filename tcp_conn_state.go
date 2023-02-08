@@ -232,9 +232,14 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 		// Continue packet processing in case this packet has data
 	case tcpConnStateEst:
 		if hdr.Fin {
-			s.state = tcpConnStateCloseWait
-			s.recvClosed = true
-			s.pendingAck = true
+			// Check the sequence number to make sure we've received all the data
+			// expected. If not, ignore the FIN until we have all the data expected.
+			recvEnd := uint32(s.recvStart + uint64(s.recvBuf.Len()))
+			if hdr.SeqNum == recvEnd {
+				s.state = tcpConnStateCloseWait
+				s.recvClosed = true
+				s.pendingAck = true
+			}
 		}
 
 	case tcpConnStateCloseWait:
