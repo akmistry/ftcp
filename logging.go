@@ -24,7 +24,7 @@ func SetLogLevel(l LogLevel) {
 }
 
 func logAtLevel(lvl LogLevel, format string, v ...any) {
-	if logLevel < lvl {
+	if lvl < logLevel {
 		return
 	}
 	log.Printf(format, v...)
