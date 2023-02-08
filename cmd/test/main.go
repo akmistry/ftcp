@@ -15,13 +15,14 @@ import (
 const (
 	maxPacketSize = 1024
 
-	errorRateNum   = 1
+	errorRateNum   = 0
 	errorRateDenom = 4
 )
 
-func doEcho(r io.Reader, w io.Writer) {
+func doEcho(r io.Reader, w io.WriteCloser) {
 	n, err := io.Copy(w, r)
 	log.Printf("io.Copy n: %d, err: %v", n, err)
+	w.Close()
 }
 
 func dropPacket() bool {
@@ -121,12 +122,7 @@ func main() {
 			continue
 		}
 
-		if dropPacket() {
-			log.Print("Out packet dropped")
-			continue
-		}
-
-		if tcpConn.PendingResponse() {
+		for tcpConn.PendingResponse() {
 			respPacket := make([]byte, maxPacketSize)
 			// Reserve 20 bytes for the IP header
 			// TODO: Support IP options
@@ -157,6 +153,11 @@ func main() {
 			copy(respPacket, respIpHeader)
 
 			dtcp.TCPSetChecksum(respTcpPacket, dtcp.TCPChecksum(respTcpPacket, packet.Header.Dst, packet.Header.Src))
+
+			if dropPacket() {
+				log.Print("Out packet dropped")
+				continue
+			}
 
 			log.Printf("Sending response to: %v", packet.Header.Src)
 			_, err = sendSock.WriteToIP(respPacket, &net.IPAddr{IP: packet.Header.Src})

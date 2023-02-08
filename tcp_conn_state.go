@@ -3,6 +3,7 @@ package dtcp
 import (
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -15,6 +16,10 @@ const (
 	tcpConnStateInit    = 0
 	tcpConnStateSynRecv = 1
 	tcpConnStateEst     = 2
+	// Received FIN from remote end, waiting for close from the user.
+	tcpConnStateCloseWait = 3
+	// Received and send FIN and waiting on FIN-ACK from remote.
+	tcpConnStateLastAck = 4
 
 	tcpInitialWindowSize = 4096
 
@@ -40,11 +45,13 @@ type TCPConnState struct {
 	sendStart uint64
 	// Next sequence number to be sent (not already sent and awaiting ack)
 	sendNextSeq uint64
+	sendClosed  bool
 
 	// Receive state
 	recvBuf        *ringbuffer.RingBuffer
 	recvWindowSize int
 	recvStart      uint64
+	recvClosed     bool
 	pendingAck     bool
 
 	lock sync.Mutex
@@ -89,6 +96,18 @@ func (s *TCPConnState) MakePacket(buf []byte) (int, error) {
 	hdr := s.makeReponseHeader()
 	if s.state == tcpConnStateSynRecv {
 		hdr.Syn = true
+	} else if s.state == tcpConnStateCloseWait {
+		// Increment the outgoing ACK to account for the received FIN.
+		hdr.AckNum++
+	}
+	if s.sendClosed && (s.sendBuf.Len() == 0) {
+		// Sender closed and no more data to send (or ACKs to be waited on).
+		hdr.Fin = true
+		if s.state == tcpConnStateCloseWait {
+			s.state = tcpConnStateLastAck
+			s.sendStart++
+		}
+		// TODO: Handle other states.
 	}
 	headerSize, err := hdr.MarshalInto(buf)
 	if err != nil {
@@ -125,6 +144,9 @@ func (s *TCPConnState) PendingResponse() bool {
 	} else if s.sendNextSeq < (s.sendStart + uint64(s.sendBuf.Len())) {
 		// Data waiting to be sent.
 		return true
+		//} else if s.state == tcpConnStateClosing && (s.sendBuf.Len() == 0) {
+		// Send final FIN packet.
+		//	return true
 	}
 	return false
 }
@@ -175,6 +197,19 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 		s.state = tcpConnStateEst
 		// Continue packet processing in case this packet has data
 	case tcpConnStateEst:
+		if hdr.Fin {
+			s.state = tcpConnStateCloseWait
+			s.recvClosed = true
+			s.pendingAck = true
+		}
+
+	case tcpConnStateCloseWait:
+
+	case tcpConnStateLastAck:
+		if hdr.Ack && hdr.AckNum == uint32(s.sendStart) {
+			LogDebug("TCP CONNECTION FULLY CLOSED!!!")
+			// TODO: Do something!
+		}
 	}
 
 	// First, look at any ACKs.
@@ -234,13 +269,20 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 				LogWarn("Out of order packet detected, dropping (unimplemented for now)...")
 				data = nil
 			} else {
+				// TODO: According to RFC 9293 3.5.3 group 3, this must be responsed to
+				// with an empty ACK.
 				LogWarn("Data outside range, dropping...")
 				data = nil
 			}
 		}
 
 		if len(data) > 0 {
-			n, err := s.recvBuf.Write(data)
+			// TODO: It's not clear whether a FIN packet can contain data.
+			// RFC 9293 3.10.4 implies it doesn't:
+			//   "Queue this until all preceding SENDs have been segmentized, then
+			//   form a FIN segment and send it."
+			// TODO: This doesn't work if we can only partially store a FIN packet.
+			n, err := s.recvBuf.Append(data)
 			if err != nil && err != ringbuffer.ErrBufferFull {
 				// Don't expect any error other than ErrBufferFull
 				panic(err)
@@ -254,7 +296,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 	}
 
 	if s.pendingAck {
-		s.cond.Signal()
+		s.cond.Broadcast()
 	}
 
 	return nil
@@ -265,6 +307,11 @@ func (s *TCPConnState) Read(b []byte) (int, error) {
 	defer s.lock.Unlock()
 
 	for s.recvBuf == nil || s.recvBuf.Len() == 0 {
+		if s.recvClosed {
+			// TODO: If data from the last FIN packet was only partially saved, we
+			// should expect a retransmission of the remaining data and wait for it.
+			return 0, io.EOF
+		}
 		s.cond.Wait()
 	}
 
@@ -282,20 +329,40 @@ func (s *TCPConnState) Write(b []byte) (int, error) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
+	if s.sendClosed {
+		return 0, io.ErrClosedPipe
+	}
+
 	written := 0
 	for len(b) > 0 {
-		for s.sendBuf.Free() == 0 {
-			// TODO: Check for connection close.
+		for s.sendBuf.Free() == 0 && !s.sendClosed {
 			s.cond.Wait()
 		}
+		if s.sendClosed {
+			return written, io.ErrClosedPipe
+		}
 
-		n, err := s.sendBuf.Write(b)
+		n, err := s.sendBuf.Append(b)
 		written += n
 		b = b[n:]
 		if err != nil && err != ringbuffer.ErrBufferFull {
-			return written, err
+			// This should never happen.
+			panic(err)
 		}
 	}
 
 	return written, nil
+}
+
+func (s *TCPConnState) Close() error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	if s.sendClosed {
+		// Already closed
+		return nil
+	}
+	s.sendClosed = true
+	s.cond.Broadcast()
+	return nil
 }
