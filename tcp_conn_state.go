@@ -13,21 +13,35 @@ import (
 type tcpConnState int
 
 const (
-	tcpConnStateInit    = 0
-	tcpConnStateSynRecv = 1
-	tcpConnStateEst     = 2
+	// TCP connection state machine (RFC 9293 3.3.2 (mostly))
+	tcpConnStateInit = iota
+	tcpConnStateSynRecv
+	tcpConnStateEst
+	tcpConnStateFinWait1
+	tcpConnStateFinWait2
 	// Received FIN from remote end, waiting for close from the user.
-	tcpConnStateCloseWait = 3
-	// Received and send FIN and waiting on FIN-ACK from remote.
-	tcpConnStateLastAck = 4
+	tcpConnStateCloseWait
+	tcpConnStateClosing
+	// Received and sent FIN and waiting on FIN-ACK from remote.
+	tcpConnStateLastAck
+	tcpConnStateTimeWait
+	// Any connection in this state should be removed.
+	tcpConnStateClosed
+)
 
+const (
+	// Initial window size
+	// TODO: Increase this
 	tcpInitialWindowSize = 4096
 
+	// Mask of high-order 4-byte of the tracked 64-bit sequence numbers
 	tcpSeqHighMask = 0xFFFFFFFF00000000
 
-	tcpMinPacketSize = 20
+	// Minimum size of a TCP packet (minimum header size)
+	tcpMinPacketSize = TcpMinHeaderSize
 
 	// Use a static 1 second retransmission timeout
+	// TODO: Replace with Karn's algorithm, as required by RFC 9293 3.8.1
 	tcpRto = time.Second
 
 	gigabyte = (1 << 30)
