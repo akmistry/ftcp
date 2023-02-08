@@ -183,17 +183,21 @@ type tcpChecksum struct {
 }
 
 func (c *tcpChecksum) AddBuf(buf []byte) {
+	if len(buf)%2 == 1 {
+		c.sum += uint32(buf[len(buf)-1]) << 8
+		buf = buf[:len(buf)-1]
+	}
 	for i := 0; i < len(buf); i += 2 {
-		if i+1 >= len(buf) {
-			c.sum += uint32(buf[i]) << 8
-		} else {
-			c.sum += uint32(be.Uint16(buf[i : i+2]))
-		}
+		c.sum += uint32(be.Uint16(buf[i : i+2]))
 	}
 }
 
 func (c *tcpChecksum) Sum() uint16 {
-	return ^(uint16(c.sum) + uint16(c.sum>>16))
+	// Fold the upper bits into the lower ones
+	sum := (c.sum & 0xFFFF) + (c.sum >> 16)
+	// Fold again since the previous addition can overflow
+	sum += (sum >> 16)
+	return ^(uint16(sum))
 }
 
 func TCPChecksum(packet []byte, srcAddr, dstAddr net.IP) uint16 {
