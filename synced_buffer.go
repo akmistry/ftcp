@@ -54,6 +54,10 @@ func (b *SyncedBuffer) Cap() int {
 	return b.rb.Cap()
 }
 
+func (b *SyncedBuffer) Free() int {
+	return b.Cap() - b.Len()
+}
+
 func (b *SyncedBuffer) Ack(ack uint32) bool {
 	diff := ack - uint32(b.startSeq)
 	sentBytes := uint32(b.nextSeq - b.startSeq)
@@ -88,4 +92,12 @@ func (b *SyncedBuffer) Fetch(buf []byte, offset int) int {
 	}
 	data := b.rb.Peek(offset)
 	return copy(buf, data)
+}
+
+func (b *SyncedBuffer) Consume(n int) {
+	if n > b.Len() {
+		panic("n > b.Len()")
+	}
+	b.startSeq += uint64(n)
+	b.rb.Consume(n)
 }

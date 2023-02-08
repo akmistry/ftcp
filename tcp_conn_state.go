@@ -7,8 +7,6 @@ import (
 	"net"
 	"sync"
 	"time"
-
-	"github.com/akmistry/go-util/ringbuffer"
 )
 
 type tcpConnState int
@@ -61,11 +59,9 @@ type TCPConnState struct {
 	sendClosed bool
 
 	// Receive state
-	recvBuf        *ringbuffer.RingBuffer
-	recvWindowSize int
-	recvStart      uint64
-	recvClosed     bool
-	pendingAck     bool
+	recvBuf    *SyncedBuffer
+	recvClosed bool
+	pendingAck bool
 
 	lastAckTime time.Time
 
@@ -113,7 +109,7 @@ func (s *TCPConnState) makeHeader() *TCPHeader {
 		WindowSize: s.recvBuf.Free(),
 
 		Ack:    true,
-		AckNum: uint32(s.recvStart + uint64(s.recvBuf.Len())),
+		AckNum: uint32(s.recvBuf.EndSeq()),
 
 		SeqNum: uint32(s.sendBuf.NextSendSeq()),
 	}
@@ -210,9 +206,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 			return errors.New("Expected SYN packet")
 		}
 
-		s.recvStart = uint64(hdr.SeqNum) + 1
-		s.recvBuf = ringbuffer.NewRingBuffer(make([]byte, tcpInitialWindowSize))
-		s.recvWindowSize = hdr.WindowSize
+		s.recvBuf = NewSyncedBuffer(hdr.SeqNum+1, tcpInitialWindowSize)
 
 		s.state = tcpConnStateSynRecv
 		s.pendingAck = true
@@ -231,10 +225,11 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 		s.state = tcpConnStateEst
 		// Continue packet processing in case this packet has data
 	case tcpConnStateEst:
-		if hdr.Fin {
+		// Ignore FIN if the packet contains data
+		if hdr.Fin && len(data) == 0 {
 			// Check the sequence number to make sure we've received all the data
 			// expected. If not, ignore the FIN until we have all the data expected.
-			recvEnd := uint32(s.recvStart + uint64(s.recvBuf.Len()))
+			recvEnd := uint32(s.recvBuf.EndSeq())
 			if hdr.SeqNum == recvEnd {
 				s.state = tcpConnStateCloseWait
 				s.recvClosed = true
@@ -276,9 +271,10 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 	if len(data) > 0 {
 		//LogDebug("TCP pending data: %v", data)
 
-		recvEnd := s.recvStart + uint64(s.recvBuf.Len())
+		recvEnd := s.recvBuf.EndSeq()
 		if hdr.SeqNum != uint32(recvEnd) {
-			LogDebug("Seq: %d, revcStart: %d, recvEnd: %d", hdr.SeqNum, s.recvStart, recvEnd)
+			LogDebug("Seq: %d, revcStart: %d, recvEnd: %d",
+				hdr.SeqNum, s.recvBuf.StartSeq(), recvEnd)
 
 			// Since the sequence number is 32-bit and wraps around, it's ambiguous
 			// whether the received packet is before or after our current window. So
@@ -311,16 +307,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 		}
 
 		if len(data) > 0 {
-			// TODO: It's not clear whether a FIN packet can contain data.
-			// RFC 9293 3.10.4 implies it doesn't:
-			//   "Queue this until all preceding SENDs have been segmentized, then
-			//   form a FIN segment and send it."
-			// TODO: This doesn't work if we can only partially store a FIN packet.
-			n, err := s.recvBuf.Append(data)
-			if err != nil && err != ringbuffer.ErrBufferFull {
-				// Don't expect any error other than ErrBufferFull
-				panic(err)
-			}
+			n := s.recvBuf.Append(data)
 			if n > 0 {
 				s.pendingAck = true
 			}
@@ -348,18 +335,12 @@ func (s *TCPConnState) Read(b []byte) (int, error) {
 
 	for s.recvBuf == nil || s.recvBuf.Len() == 0 {
 		if s.recvClosed {
-			// TODO: If data from the last FIN packet was only partially saved, we
-			// should expect a retransmission of the remaining data and wait for it.
 			return 0, io.EOF
 		}
 		s.cond.Wait()
 	}
 
-	readBuf := s.recvBuf.Peek(0)
-	if len(readBuf) == 0 {
-		panic("len(readBuf) == 0")
-	}
-	n := copy(b, readBuf)
+	n := s.recvBuf.Fetch(b, 0)
 
 	if s.recvBuf.Free() == 0 && n > 0 {
 		// We're about free up some space in the receive buffer, so let the remote
@@ -368,7 +349,6 @@ func (s *TCPConnState) Read(b []byte) (int, error) {
 		go s.sendNextPacket()
 	}
 	s.recvBuf.Consume(n)
-	s.recvStart += uint64(n)
 	LogDebug("Read %d from TCP conn, remaining: %d", n, s.recvBuf.Len())
 	return n, nil
 }
