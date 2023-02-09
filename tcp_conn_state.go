@@ -132,6 +132,7 @@ func (s *TCPConnState) packetSender() {
 			s.pendingSendCond.Wait()
 		}
 	}
+
 }
 
 func (s *TCPConnState) triggerSendPacket() {
@@ -256,6 +257,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 	case tcpConnStateLastAck:
 		if hdr.Ack && hdr.AckNum == uint32(s.sendBuf.EndSeq()+1) {
 			s.state = tcpConnStateClosed
+			s.triggerSendPacket()
 			LogDebug("TCP CONNECTION FULLY CLOSED!!!")
 			// TODO: Do something!
 			return nil
