@@ -73,11 +73,11 @@ type TCPConnState struct {
 	cond *sync.Cond
 }
 
-func NewTCPConnState(tcpSynHeader *TCPHeader, sender TCPSender, remoteAddr *net.IPAddr) *TCPConnState {
+func NewTCPConnState(localPort, remotePort uint16, sender TCPSender, remoteAddr *net.IPAddr) *TCPConnState {
 	s := &TCPConnState{
 		sender:     sender,
-		localPort:  tcpSynHeader.DstPort,
-		remotePort: tcpSynHeader.SrcPort,
+		localPort:  localPort,
+		remotePort: remotePort,
 		remoteAddr: remoteAddr,
 		sendBuf:    NewSyncedBuffer(1, tcpInitialWindowSize),
 		// TODO: Use a SYN cookie.

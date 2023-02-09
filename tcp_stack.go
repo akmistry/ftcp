@@ -4,6 +4,8 @@ import (
 	"errors"
 	"io"
 	"net"
+
+	"github.com/akmistry/ftcp/pb"
 )
 
 var (
@@ -62,7 +64,7 @@ func (s *TCPStack) HandleIPPacket(packet *IPPacket) error {
 	// TODO: Support the full 4-tuple for connection identity
 	tcpConn := s.connMap.GetState(packet.Header.Src, tcpHeader.SrcPort)
 	if tcpConn == nil && tcpHeader.Syn {
-		tcpConn = NewTCPConnState(tcpHeader, s, &net.IPAddr{IP: packet.Header.Src})
+		tcpConn = NewTCPConnState(tcpHeader.DstPort, tcpHeader.SrcPort, s, &net.IPAddr{IP: packet.Header.Src})
 		s.connMap.PutState(packet.Header.Src, tcpHeader.SrcPort, tcpConn)
 
 		// TODO: This is wrong. We should only declare a new connection when we
@@ -93,4 +95,22 @@ func (s *TCPStack) SendTCPPacket(b []byte, addr *net.IPAddr, port uint16) error 
 func (s *TCPStack) Listen() (io.ReadWriteCloser, error) {
 	c := <-s.connCh
 	return c, nil
+}
+
+func (s *TCPStack) Sync(req *pb.SyncRequest, reply *pb.SyncReply) error {
+	if req.Key == nil {
+		return errors.New("TCPStack.Sync: request missing key")
+	}
+	tcpConn := s.connMap.GetState(req.Key.RemoteAddr, uint16(req.Key.RemotePort))
+	if tcpConn == nil && req.State != pb.TcpConnState_CLOSED {
+		tcpConn = NewTCPConnState(uint16(req.Key.LocalPort), uint16(req.Key.RemotePort), s, &net.IPAddr{IP: req.Key.RemoteAddr})
+		s.connMap.PutState(req.Key.RemoteAddr, uint16(req.Key.RemotePort), tcpConn)
+	}
+	if tcpConn != nil && req.State == pb.TcpConnState_CLOSED {
+		// TODO: Delete state.
+	}
+
+	// TODO: Do sync.
+
+	return nil
 }
