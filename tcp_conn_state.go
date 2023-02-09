@@ -7,25 +7,27 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/akmistry/ftcp/pb"
 )
 
-type tcpConnState int
+type tcpConnState = pb.TcpConnState
 
 const (
 	// TCP connection state machine (RFC 9293 3.3.2 (mostly))
-	tcpConnStateInit = iota
-	tcpConnStateSynRecv
-	tcpConnStateEst
-	tcpConnStateFinWait1
-	tcpConnStateFinWait2
+	tcpConnStateInit     = pb.TcpConnState_INIT
+	tcpConnStateSynRecv  = pb.TcpConnState_SYN_RECV
+	tcpConnStateEst      = pb.TcpConnState_EST
+	tcpConnStateFinWait1 = pb.TcpConnState_FIN_WAIT_1
+	tcpConnStateFinWait2 = pb.TcpConnState_FIN_WAIT_2
 	// Received FIN from remote end, waiting for close from the user.
-	tcpConnStateCloseWait
-	tcpConnStateClosing
+	tcpConnStateCloseWait = pb.TcpConnState_CLOSE_WAIT
+	tcpConnStateClosing   = pb.TcpConnState_CLOSING
 	// Received and sent FIN and waiting on FIN-ACK from remote.
-	tcpConnStateLastAck
-	tcpConnStateTimeWait
+	tcpConnStateLastAck  = pb.TcpConnState_LAST_ACK
+	tcpConnStateTimeWait = pb.TcpConnState_TIME_WAIT
 	// Any connection in this state should be removed.
-	tcpConnStateClosed
+	tcpConnStateClosed = pb.TcpConnState_CLOSED
 )
 
 const (
