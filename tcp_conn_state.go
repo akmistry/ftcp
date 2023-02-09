@@ -65,7 +65,8 @@ type TCPConnState struct {
 	lastAckTime time.Time
 
 	// There is a pending outgoing packet
-	pendingSend bool
+	pendingSend     bool
+	pendingSendCond *sync.Cond
 
 	lock sync.Mutex
 	// TODO: Seperate condvars for send and receive buffers
@@ -83,7 +84,9 @@ func NewTCPConnState(tcpSynHeader *TCPHeader, sender TCPSender, remoteAddr *net.
 		state: tcpConnStateInit,
 	}
 	s.cond = sync.NewCond(&s.lock)
+	s.pendingSendCond = sync.NewCond(&s.lock)
 	go s.retransmitTimeout()
+	go s.packetSender()
 	return s
 }
 
@@ -100,7 +103,7 @@ func (s *TCPConnState) retransmitTimeout() {
 		if now.Sub(s.lastAckTime) > tcpRto && s.sendBuf.Len() > 0 {
 			LogDebug("Retransmission timeout!!!")
 			s.sendBuf.ResetNextSeq()
-			go s.sendNextPacket()
+			s.triggerSendPacket()
 		}
 	}
 }
@@ -118,18 +121,28 @@ func (s *TCPConnState) makeHeader() *TCPHeader {
 	}
 }
 
-func (s *TCPConnState) sendNextPacket() {
+func (s *TCPConnState) packetSender() {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
-	pendingPacket := false
-	if s.pendingSend {
-		pendingPacket = true
-	} else if s.sendBuf.HasUnsentData() {
-		// Data waiting to be sent.
-		pendingPacket = true
+	for s.state != tcpConnStateClosed {
+		s.trySendNextPacket()
+
+		for s.state != tcpConnStateClosed && !s.pendingSend {
+			s.pendingSendCond.Wait()
+		}
 	}
-	if !pendingPacket {
+}
+
+func (s *TCPConnState) triggerSendPacket() {
+	if !s.pendingSend {
+		s.pendingSend = true
+		s.pendingSendCond.Signal()
+	}
+}
+
+func (s *TCPConnState) trySendNextPacket() {
+	if !s.pendingSend {
 		return
 	}
 
@@ -181,7 +194,7 @@ func (s *TCPConnState) sendNextPacket() {
 
 	if s.sendBuf.HasUnsentData() {
 		// More data, send another packet.
-		go s.sendNextPacket()
+		s.pendingSend = true
 	}
 }
 
@@ -211,8 +224,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 		s.recvBuf = NewSyncedBuffer(hdr.SeqNum+1, tcpInitialWindowSize)
 
 		s.state = tcpConnStateSynRecv
-		s.pendingSend = true
-		go s.sendNextPacket()
+		s.triggerSendPacket()
 		// No more packet processing
 		return nil
 	case tcpConnStateSynRecv:
@@ -235,7 +247,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 			if hdr.SeqNum == recvEnd {
 				s.state = tcpConnStateCloseWait
 				s.recvClosed = true
-				s.pendingSend = true
+				s.triggerSendPacket()
 			}
 		}
 
@@ -295,7 +307,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 				} else {
 					data = nil
 				}
-				s.pendingSend = true
+				s.triggerSendPacket()
 			} else if offsetAfter < gigabyte {
 				// TODO: Implement out-of-order packet handling.
 				LogWarn("Out of order packet detected, dropping (unimplemented for now)...")
@@ -305,7 +317,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 				data = nil
 				// TODO: According to RFC 9293 3.5.2 group 3, this must be responded to
 				// with an __empty__ ACK.
-				s.pendingSend = true
+				s.triggerSendPacket()
 			}
 		}
 
@@ -315,7 +327,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 				// New data in the receive buffer, signal any waiting readers.
 				s.cond.Broadcast()
 				// Send an ACK.
-				s.pendingSend = true
+				s.triggerSendPacket()
 			}
 		}
 
@@ -323,11 +335,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 	}
 
 	if s.sendClosed && (s.sendBuf.Len() == 0) {
-		s.pendingSend = true
-	}
-
-	if s.pendingSend {
-		go s.sendNextPacket()
+		s.triggerSendPacket()
 	}
 
 	return nil
@@ -349,8 +357,7 @@ func (s *TCPConnState) Read(b []byte) (int, error) {
 	if s.recvBuf.Free() == 0 && n > 0 {
 		// We're about free up some space in the receive buffer, so let the remote
 		// end know.
-		s.pendingSend = true
-		go s.sendNextPacket()
+		s.triggerSendPacket()
 	}
 	s.recvBuf.Consume(n)
 	LogDebug("Read %d from TCP conn, remaining: %d", n, s.recvBuf.Len())
@@ -378,7 +385,7 @@ func (s *TCPConnState) Write(b []byte) (int, error) {
 		LogDebug("Written %d to TCP conn, sendBufLen: %d", n, s.sendBuf.Len())
 		written += n
 		b = b[n:]
-		go s.sendNextPacket()
+		s.triggerSendPacket()
 	}
 
 	return written, nil
@@ -394,9 +401,8 @@ func (s *TCPConnState) Close() error {
 	}
 
 	s.sendClosed = true
-	// Potentially send FIN if there is no data in the send buffer.
-	s.pendingSend = true
 	s.cond.Broadcast()
-	go s.sendNextPacket()
+	// Potentially send FIN if there is no data in the send buffer.
+	s.triggerSendPacket()
 	return nil
 }
