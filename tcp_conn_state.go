@@ -139,7 +139,7 @@ func (s *TCPConnState) packetSender() {
 
 		s.trySendNextPacket()
 
-		for s.state != tcpConnStateClosed && !s.pendingSend {
+		for s.state != tcpConnStateClosed && !s.pendingSend && !s.pendingSync {
 			s.pendingSendCond.Wait()
 		}
 	}
@@ -149,6 +149,13 @@ func (s *TCPConnState) packetSender() {
 func (s *TCPConnState) triggerSendPacket() {
 	if !s.pendingSend {
 		s.pendingSend = true
+		s.pendingSendCond.Signal()
+	}
+}
+
+func (s *TCPConnState) triggerSync() {
+	if !s.pendingSync {
+		s.pendingSync = true
 		s.pendingSendCond.Signal()
 	}
 }
@@ -173,6 +180,7 @@ func (s *TCPConnState) trySendNextPacket() {
 		hdr.Fin = true
 		if s.state == tcpConnStateCloseWait {
 			s.state = tcpConnStateLastAck
+			s.triggerSync()
 		}
 		// TODO: Handle other states.
 	}
@@ -197,7 +205,8 @@ func (s *TCPConnState) trySendNextPacket() {
 		s.sendBuf.SendData(n)
 	}
 
-	LogDebug("Response TCP packet: %v", hdr)
+	LogDebug("Sending TCP packet with %d bytes data: %v",
+		packetSize-TcpMinHeaderSize, hdr)
 
 	err = s.sender.SendTCPPacket(buf[:packetSize], s.remoteAddr, s.remotePort)
 	if err != nil {
@@ -258,8 +267,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 	case tcpConnStateLastAck:
 		if hdr.Ack && hdr.AckNum == uint32(s.sendBuf.EndSeq()+1) {
 			s.state = tcpConnStateClosed
-			s.pendingSync = true
-			s.triggerSendPacket()
+			s.triggerSync()
 			LogDebug("TCP CONNECTION FULLY CLOSED!!!")
 			// TODO: Do something!
 			return nil
@@ -280,7 +288,8 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 			s.cond.Broadcast()
 
 			s.lastAckTime = time.Now()
-			s.pendingSync = true
+			s.triggerSync()
+			s.triggerSendPacket()
 		}
 		LogDebug("AFTER: Received ack: %d, s.sendStart: %d, sendEnd: %d",
 			hdr.AckNum, s.sendBuf.StartSeq(), s.sendBuf.EndSeq())
@@ -413,7 +422,7 @@ func (s *TCPConnState) ConsumeThenRead(b []byte, offset uint64) (int, error) {
 	if s.recvBuf.Free() == 0 && n > 0 {
 		// We're about free up some space in the receive buffer, so let the remote
 		// end know.
-		s.pendingSync = true
+		s.triggerSync()
 		s.triggerSendPacket()
 	}
 	if n > 0 {
@@ -463,7 +472,7 @@ func (s *TCPConnState) AppendAt(b []byte, offset uint64) (int, error) {
 		LogDebug("Written %d to TCP conn, sendBufLen: %d", n, s.sendBuf.Len())
 		written += n
 		b = b[n:]
-		s.pendingSync = true
+		s.triggerSync()
 		s.triggerSendPacket()
 	}
 
@@ -483,6 +492,7 @@ func (s *TCPConnState) Close() error {
 	s.cond.Broadcast()
 	// Potentially send FIN if there is no data in the send buffer.
 	s.triggerSendPacket()
+	s.triggerSync()
 	return nil
 }
 
@@ -499,6 +509,7 @@ func (s *TCPConnState) sendSyncRequest() {
 		},
 		State:         s.state,
 		SendBufUpdate: &pb.BufferStateUpdate{},
+		SendClosed:    s.sendClosed,
 		RecvBufUpdate: &pb.BufferStateUpdate{},
 	}
 	s.sendBuf.FillStateUpdate(req.SendBufUpdate)
@@ -536,6 +547,7 @@ func (s *TCPConnState) sendSyncRequest() {
 	err := s.sender.SendSyncRequest(&req, &reply)
 	if err != nil {
 		LogWarn("TCPConnState: error doing Sync: %v", err)
+		s.pendingSync = false
 	} else {
 		LogInfo("TCPConnState: Update reply: %+v", reply)
 	}
@@ -552,6 +564,9 @@ func (s *TCPConnState) sendSyncRequest() {
 		s.recvBuf.UpdateState(reply.RecvBufUpdate)
 	}
 	s.syncState(reply.State)
+	if reply.SendClosed {
+		s.sendClosed = reply.SendClosed
+	}
 
 	// Wake up any reader/writers in case buffer states have changed.
 	s.cond.Broadcast()
@@ -563,7 +578,7 @@ func (s *TCPConnState) syncState(reqState tcpConnState) {
 		return
 	}
 
-	if reqState > tcpConnStateCloseWait {
+	if reqState >= tcpConnStateCloseWait {
 		s.recvClosed = true
 	}
 	s.state = reqState
@@ -577,7 +592,11 @@ func (s *TCPConnState) Sync(req *pb.SyncRequest, reply *pb.SyncReply) error {
 
 	if req.SendBufUpdate != nil {
 		reply.SendBufUpdate = &pb.BufferStateUpdate{}
+		startSeq := s.sendBuf.StartSeq()
 		s.sendBuf.Sync(req.SendBufUpdate, reply.SendBufUpdate)
+		if s.sendBuf.StartSeq() > startSeq {
+			s.lastAckTime = time.Now()
+		}
 	}
 
 	if s.state == tcpConnStateInit && req.State > tcpConnStateInit {
@@ -595,6 +614,13 @@ func (s *TCPConnState) Sync(req *pb.SyncRequest, reply *pb.SyncReply) error {
 		s.syncState(req.State)
 	}
 	reply.State = s.state
+
+	if req.SendClosed {
+		s.sendClosed = req.SendClosed
+	}
+	reply.SendClosed = s.sendClosed
+
+	s.cond.Broadcast()
 
 	return nil
 }

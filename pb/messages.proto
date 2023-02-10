@@ -45,6 +45,8 @@ message SyncRequest {
   // Buffer state update of the send buffer
   BufferStateUpdate send_buf_update = 8;
 
+  bool send_closed = 9;
+
   // Buffer state update of the recv buffer
   BufferStateUpdate recv_buf_update = 12;
 }
@@ -58,6 +60,8 @@ message SyncReply {
 
   // Buffer state update of the send buffer
   BufferStateUpdate send_buf_update = 8;
+
+  bool send_closed = 9;
 
   // Buffer state update of the recv buffer
   BufferStateUpdate recv_buf_update = 12;
