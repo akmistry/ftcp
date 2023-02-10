@@ -464,6 +464,10 @@ func (s *TCPConnState) sendSyncRequest() {
 		LogInfo("TCPConnState: Update reply: %+v", reply)
 	}
 	s.lock.Lock()
+
+	// TODO: When the reply is received, it will tell us if the replica is behind
+	// and needs us to send it more data. See the last comment in
+	// SyncedBuffer.UpdateState() for details.
 }
 
 func (s *TCPConnState) syncState(reqState tcpConnState) {
