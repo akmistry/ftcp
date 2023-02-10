@@ -68,6 +68,12 @@ type TCPConnState struct {
 	pendingSend     bool
 	pendingSendCond *sync.Cond
 
+	pendingSync bool
+
+	// Last synced sequence numbers of send and recv buffers
+	sendSyncSeq uint64
+	recvSyncSeq uint64
+
 	lock sync.Mutex
 	// TODO: Seperate condvars for send and receive buffers
 	cond *sync.Cond
@@ -126,6 +132,8 @@ func (s *TCPConnState) packetSender() {
 	defer s.lock.Unlock()
 
 	for s.state != tcpConnStateClosed {
+		s.sendSyncRequest()
+
 		s.trySendNextPacket()
 
 		for s.state != tcpConnStateClosed && !s.pendingSend {
@@ -199,19 +207,6 @@ func (s *TCPConnState) trySendNextPacket() {
 	}
 }
 
-func isInWindow(x, windowStart, windowEnd uint32) bool {
-	// Window is half-open interval: [windowStart, windowEnd)
-	if windowEnd < windowStart {
-		// Window wraps around.
-		// [--------->end.......<start---------]
-		return x >= windowStart || x < windowEnd
-	}
-
-	// Non-wrap around window
-	// [.....<start------------->end.......]
-	return x >= windowStart && x < windowEnd
-}
-
 func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 	s.lock.Lock()
 	defer s.lock.Unlock()
@@ -238,6 +233,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 		}
 
 		s.state = tcpConnStateEst
+		s.pendingSync = true
 		// Continue packet processing in case this packet has data
 	case tcpConnStateEst:
 		// Ignore FIN if the packet contains data
@@ -248,6 +244,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 			if hdr.SeqNum == recvEnd {
 				s.state = tcpConnStateCloseWait
 				s.recvClosed = true
+				s.pendingSync = true
 				s.triggerSendPacket()
 			}
 		}
@@ -257,6 +254,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 	case tcpConnStateLastAck:
 		if hdr.Ack && hdr.AckNum == uint32(s.sendBuf.EndSeq()+1) {
 			s.state = tcpConnStateClosed
+			s.pendingSync = true
 			s.triggerSendPacket()
 			LogDebug("TCP CONNECTION FULLY CLOSED!!!")
 			// TODO: Do something!
@@ -278,6 +276,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 			s.cond.Broadcast()
 
 			s.lastAckTime = time.Now()
+			s.pendingSync = true
 		}
 		LogDebug("AFTER: Received ack: %d, s.sendStart: %d, sendEnd: %d",
 			hdr.AckNum, s.sendBuf.StartSeq(), s.sendBuf.EndSeq())
@@ -329,6 +328,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 				// New data in the receive buffer, signal any waiting readers.
 				s.cond.Broadcast()
 				// Send an ACK.
+				s.pendingSync = true
 				s.triggerSendPacket()
 			}
 		}
@@ -387,6 +387,7 @@ func (s *TCPConnState) Write(b []byte) (int, error) {
 		LogDebug("Written %d to TCP conn, sendBufLen: %d", n, s.sendBuf.Len())
 		written += n
 		b = b[n:]
+		s.pendingSync = true
 		s.triggerSendPacket()
 	}
 
@@ -406,5 +407,103 @@ func (s *TCPConnState) Close() error {
 	s.cond.Broadcast()
 	// Potentially send FIN if there is no data in the send buffer.
 	s.triggerSendPacket()
+	return nil
+}
+
+func (s *TCPConnState) sendSyncRequest() {
+	if !s.pendingSync {
+		return
+	}
+
+	req := pb.SyncRequest{
+		Key: &pb.StreamKey{
+			RemoteAddr: s.remoteAddr.IP,
+			RemotePort: uint32(s.remotePort),
+			LocalPort:  uint32(s.localPort),
+		},
+		State:         s.state,
+		SendBufUpdate: &pb.BufferStateUpdate{},
+		RecvBufUpdate: &pb.BufferStateUpdate{},
+	}
+	s.sendBuf.FillStateUpdate(req.SendBufUpdate)
+	s.recvBuf.FillStateUpdate(req.RecvBufUpdate)
+
+	if s.sendBuf.EndSeq() > s.sendSyncSeq {
+		if s.sendSyncSeq < s.sendBuf.StartSeq() {
+			s.sendSyncSeq = s.sendBuf.StartSeq()
+		}
+		appendLen := int(s.sendBuf.EndSeq() - s.sendSyncSeq)
+		if appendLen > 0 {
+			req.SendBufUpdate.AppendSeq = s.sendSyncSeq
+			req.SendBufUpdate.AppendData = make([]byte, appendLen)
+			s.sendBuf.Fetch(req.SendBufUpdate.AppendData, int(s.sendSyncSeq-s.sendBuf.StartSeq()))
+		}
+		s.sendSyncSeq = s.sendBuf.EndSeq()
+	}
+	if s.recvBuf.EndSeq() > s.recvSyncSeq {
+		if s.recvSyncSeq < s.recvBuf.StartSeq() {
+			s.recvSyncSeq = s.recvBuf.StartSeq()
+		}
+		appendLen := int(s.recvBuf.EndSeq() - s.recvSyncSeq)
+		if appendLen > 0 {
+			req.RecvBufUpdate.AppendSeq = s.recvSyncSeq
+			req.RecvBufUpdate.AppendData = make([]byte, appendLen)
+			s.recvBuf.Fetch(req.RecvBufUpdate.AppendData, int(s.recvSyncSeq-s.recvBuf.StartSeq()))
+		}
+		s.recvSyncSeq = s.recvBuf.EndSeq()
+	}
+	s.pendingSync = false
+	LogInfo("TCPConnState: Update request: %+v", req)
+
+	reply := pb.SyncReply{}
+	s.lock.Unlock()
+	err := s.sender.SendSyncRequest(&req, &reply)
+	if err != nil {
+		LogWarn("TCPConnState: error doing Sync: %v", err)
+	} else {
+		LogInfo("TCPConnState: Update reply: %+v", reply)
+	}
+	s.lock.Lock()
+}
+
+func (s *TCPConnState) syncState(reqState tcpConnState) {
+	// TODO: Handle more subtle state transitions
+	if reqState < s.state {
+		return
+	}
+
+	if reqState > tcpConnStateCloseWait {
+		s.recvClosed = true
+	}
+	s.state = reqState
+}
+
+func (s *TCPConnState) Sync(req *pb.SyncRequest, reply *pb.SyncReply) error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	LogInfo("TCPConnState: received sync request: %+v", *req)
+
+	if req.SendBufUpdate != nil {
+		reply.SendBufUpdate = &pb.BufferStateUpdate{}
+		s.sendBuf.Sync(req.SendBufUpdate, reply.SendBufUpdate)
+	}
+
+	if s.state == tcpConnStateInit && req.State > tcpConnStateInit {
+		// The sequence number will be fast-forwarded on the recv buffer update
+		// below.
+		s.recvBuf = NewSyncedBuffer(0, tcpInitialWindowSize)
+		s.state = tcpConnStateSynRecv
+	}
+	if req.RecvBufUpdate != nil {
+		reply.RecvBufUpdate = &pb.BufferStateUpdate{}
+		s.recvBuf.Sync(req.RecvBufUpdate, reply.RecvBufUpdate)
+	}
+
+	if req.State != pb.TcpConnState_INIT {
+		s.syncState(req.State)
+	}
+	reply.State = s.state
+
 	return nil
 }

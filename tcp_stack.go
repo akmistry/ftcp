@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 
 	"github.com/akmistry/ftcp/pb"
 )
@@ -14,6 +15,7 @@ var (
 
 type TCPSender interface {
 	SendTCPPacket(b []byte, addr *net.IPAddr, port uint16) error
+	SendSyncRequest(req *pb.SyncRequest, reply *pb.SyncReply) error
 }
 
 type TCPStack struct {
@@ -22,6 +24,9 @@ type TCPStack struct {
 	connMap   *TCPConnMap
 
 	connCh chan *TCPConnState
+
+	syncClient *SyncClient
+	lock       sync.Mutex
 }
 
 func NewTCPStack(ipSender IPSender, localAddr *net.IPAddr) *TCPStack {
@@ -32,6 +37,12 @@ func NewTCPStack(ipSender IPSender, localAddr *net.IPAddr) *TCPStack {
 		connCh:    make(chan *TCPConnState, 64),
 	}
 	return s
+}
+
+func (s *TCPStack) SetSyncClient(c *SyncClient) {
+	s.lock.Lock()
+	s.syncClient = c
+	s.lock.Unlock()
 }
 
 func (s *TCPStack) HandleIPPacket(packet *IPPacket) error {
@@ -92,6 +103,17 @@ func (s *TCPStack) SendTCPPacket(b []byte, addr *net.IPAddr, port uint16) error 
 	return s.ipSender.SendIPPacket(b, addr)
 }
 
+func (s *TCPStack) SendSyncRequest(req *pb.SyncRequest, reply *pb.SyncReply) error {
+	s.lock.Lock()
+	c := s.syncClient
+	s.lock.Unlock()
+
+	if c == nil {
+		return nil
+	}
+	return c.SendSync(req, reply)
+}
+
 func (s *TCPStack) Listen() (io.ReadWriteCloser, error) {
 	c := <-s.connCh
 	return c, nil
@@ -106,11 +128,13 @@ func (s *TCPStack) Sync(req *pb.SyncRequest, reply *pb.SyncReply) error {
 		tcpConn = NewTCPConnState(uint16(req.Key.LocalPort), uint16(req.Key.RemotePort), s, &net.IPAddr{IP: req.Key.RemoteAddr})
 		s.connMap.PutState(req.Key.RemoteAddr, uint16(req.Key.RemotePort), tcpConn)
 	}
-	if tcpConn != nil && req.State == pb.TcpConnState_CLOSED {
+	if tcpConn == nil {
+		return nil
+	}
+	if req.State == pb.TcpConnState_CLOSED {
 		// TODO: Delete state.
+		return nil
 	}
 
-	// TODO: Do sync.
-
-	return nil
+	return tcpConn.Sync(req, reply)
 }

@@ -1,10 +1,14 @@
 package main
 
 import (
+	"errors"
 	"io"
 	"log"
 	"math/rand"
 	"net"
+	"net/http"
+	_ "net/http/pprof"
+	"sync"
 
 	"golang.org/x/sys/unix"
 
@@ -12,8 +16,6 @@ import (
 )
 
 const (
-	maxPacketSize = 1024
-
 	errorRateNum   = 0
 	errorRateDenom = 4
 )
@@ -51,8 +53,89 @@ func (a *socketAdapter) WriteToIP(b []byte, addr *net.IPAddr) (int, error) {
 	return a.ipSendSock.WriteToIP(b, addr)
 }
 
+type testStack struct {
+	ipStack  *ftcp.IPStack
+	tcpStack *ftcp.TCPStack
+
+	syncServ   *ftcp.SyncServer
+	syncClient *ftcp.SyncClient
+
+	shutdown bool
+	conn     ftcp.IPConn
+	lock     sync.Mutex
+	cond     *sync.Cond
+}
+
+func newTestStack(lAddr *net.IPAddr) *testStack {
+	s := &testStack{}
+	s.ipStack = ftcp.NewIPStack(s, lAddr)
+	s.tcpStack = ftcp.NewTCPStack(s.ipStack, lAddr)
+	s.ipStack.RegisterProtocolHandler(unix.IPPROTO_TCP, s.tcpStack)
+	s.cond = sync.NewCond(&s.lock)
+	return s
+}
+
+func (s *testStack) setConn(conn ftcp.IPConn) {
+	s.lock.Lock()
+	s.conn = conn
+	s.cond.Signal()
+	s.lock.Unlock()
+}
+
+func (s *testStack) setupSync(listenAddr, remoteAddr string) {
+	l, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		panic(err)
+	}
+	s.syncServ = ftcp.NewSyncServer(l, s.tcpStack)
+
+	s.syncClient = ftcp.NewSyncClient(remoteAddr)
+	s.tcpStack.SetSyncClient(s.syncClient)
+}
+
+func (s *testStack) run() {
+	err := s.ipStack.Run()
+	if err != nil {
+		panic(err)
+	}
+}
+
+func (s *testStack) shutDown() {
+	s.lock.Lock()
+	s.shutdown = true
+	s.cond.Signal()
+	s.lock.Unlock()
+}
+
+func (s *testStack) ReadFromIP(b []byte) (int, *net.IPAddr, error) {
+	s.lock.Lock()
+	for s.conn == nil && !s.shutdown {
+		s.cond.Wait()
+	}
+	s.lock.Unlock()
+	if s.shutdown {
+		return 0, nil, errors.New("testStack: shutdown")
+	}
+	return s.conn.ReadFromIP(b)
+}
+
+func (s *testStack) WriteToIP(b []byte, addr *net.IPAddr) (int, error) {
+	s.lock.Lock()
+	conn := s.conn
+	s.lock.Unlock()
+	if conn == nil {
+		// Lie!!!
+		return len(b), nil
+	}
+	return conn.WriteToIP(b, addr)
+}
+
 func main() {
 	ftcp.SetLogLevel(ftcp.LOG_INFO)
+
+	go func() {
+		log.Println("http.ListenAndServe: ", http.ListenAndServe("localhost:6060", nil))
+	}()
 
 	ipAddr := net.IPv4(192, 168, 1, 134)
 
@@ -77,22 +160,22 @@ func main() {
 	localAddr := &net.IPAddr{
 		IP: ipAddr,
 	}
-	ipStack := ftcp.NewIPStack(adapter, localAddr)
-	tcpStack := ftcp.NewTCPStack(ipStack, localAddr)
-	ipStack.RegisterProtocolHandler(unix.IPPROTO_TCP, tcpStack)
-	go func() {
-		for {
-			ch, err := tcpStack.Listen()
-			if err != nil {
-				panic(err)
-			}
-			go doEcho(ch, ch)
-		}
-	}()
 
-	err = ipStack.Run()
-	if err != nil {
-		panic(err)
+	ts1 := newTestStack(localAddr)
+	ts1.setupSync("127.0.0.1:9991", "127.0.0.1:9992")
+	go ts1.run()
+
+	ts2 := newTestStack(localAddr)
+	ts2.setupSync("127.0.0.1:9992", "127.0.0.1:9991")
+	go ts2.run()
+
+	ts1.setConn(adapter)
+	for {
+		ch, err := ts1.tcpStack.Listen()
+		if err != nil {
+			panic(err)
+		}
+		go doEcho(ch, ch)
 	}
 
 }

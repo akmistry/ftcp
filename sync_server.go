@@ -53,6 +53,7 @@ func (s *SyncServer) doConn(conn net.Conn) {
 			continue
 		}
 
+		reply.MsgId = req.MsgId
 		_, err = pb.WriteMessage(conn, &reply)
 		if err != nil {
 			LogWarn("SyncServer: error sending reply message: %v", err)
