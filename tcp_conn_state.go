@@ -54,12 +54,14 @@ type TCPConnState struct {
 
 	// TODO: Support SACK.
 	// Send state
-	sendBuf    *SyncedBuffer
-	sendClosed bool
+	sendInitSeq uint64
+	sendBuf     *SyncedBuffer
+	sendClosed  bool
 
 	// Receive state
-	recvBuf    *SyncedBuffer
-	recvClosed bool
+	recvInitSeq uint64
+	recvBuf     *SyncedBuffer
+	recvClosed  bool
 
 	// Last ACK receive time, for the retransmission timeout
 	lastAckTime time.Time
@@ -81,11 +83,12 @@ type TCPConnState struct {
 
 func NewTCPConnState(localPort, remotePort uint16, sender TCPSender, remoteAddr *net.IPAddr) *TCPConnState {
 	s := &TCPConnState{
-		sender:     sender,
-		localPort:  localPort,
-		remotePort: remotePort,
-		remoteAddr: remoteAddr,
-		sendBuf:    NewSyncedBuffer(1, tcpInitialWindowSize),
+		sender:      sender,
+		localPort:   localPort,
+		remotePort:  remotePort,
+		remoteAddr:  remoteAddr,
+		sendInitSeq: 1,
+		sendBuf:     NewSyncedBuffer(1, tcpInitialWindowSize),
 		// TODO: Use a SYN cookie.
 		state: tcpConnStateInit,
 	}
@@ -218,6 +221,7 @@ func (s *TCPConnState) ConsumePacket(hdr *TCPHeader, data []byte) error {
 		}
 
 		s.recvBuf = NewSyncedBuffer(hdr.SeqNum+1, tcpInitialWindowSize)
+		s.recvInitSeq = uint64(hdr.SeqNum + 1)
 
 		s.state = tcpConnStateSynRecv
 		s.triggerSendPacket()
@@ -394,6 +398,78 @@ func (s *TCPConnState) Write(b []byte) (int, error) {
 	return written, nil
 }
 
+func (s *TCPConnState) ConsumeThenRead(b []byte, offset uint64) (int, error) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	consumeSeq := s.recvInitSeq + offset
+	if consumeSeq < s.recvBuf.StartSeq() {
+		return 0, errors.New("TCPConnState: offset already consumed")
+	} else if consumeSeq > s.recvBuf.EndSeq() {
+		return 0, errors.New("TCPConnState: offset ahead of data not read")
+	}
+	n := consumeSeq - s.recvBuf.StartSeq()
+
+	if s.recvBuf.Free() == 0 && n > 0 {
+		// We're about free up some space in the receive buffer, so let the remote
+		// end know.
+		s.pendingSync = true
+		s.triggerSendPacket()
+	}
+	if n > 0 {
+		s.recvBuf.Consume(int(n))
+		LogDebug("Consumed %d from TCP conn, remaining: %d", n, s.recvBuf.Len())
+	}
+
+	for s.recvBuf == nil || s.recvBuf.Len() == 0 {
+		if s.recvClosed {
+			return 0, io.EOF
+		}
+		s.cond.Wait()
+	}
+
+	return s.recvBuf.Fetch(b, 0), nil
+}
+
+func (s *TCPConnState) AppendAt(b []byte, offset uint64) (int, error) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	if s.sendClosed {
+		return 0, io.ErrClosedPipe
+	}
+
+	writeSeq := s.sendInitSeq + offset
+	if writeSeq > s.sendBuf.EndSeq() {
+		return 0, errors.New("TCPConnState: missing writes")
+	}
+
+	bufOffset := s.sendBuf.EndSeq() - writeSeq
+	if bufOffset >= uint64(len(b)) {
+		return len(b), nil
+	}
+
+	b = b[int(bufOffset):]
+	written := int(bufOffset)
+	for len(b) > 0 {
+		for (s.sendBuf.Len() == s.sendBuf.Cap()) && !s.sendClosed {
+			s.cond.Wait()
+		}
+		if s.sendClosed {
+			return written, io.ErrClosedPipe
+		}
+
+		n := s.sendBuf.Append(b)
+		LogDebug("Written %d to TCP conn, sendBufLen: %d", n, s.sendBuf.Len())
+		written += n
+		b = b[n:]
+		s.pendingSync = true
+		s.triggerSendPacket()
+	}
+
+	return written, nil
+}
+
 func (s *TCPConnState) Close() error {
 	s.lock.Lock()
 	defer s.lock.Unlock()
@@ -456,18 +532,29 @@ func (s *TCPConnState) sendSyncRequest() {
 	LogInfo("TCPConnState: Update request: %+v", req)
 
 	reply := pb.SyncReply{}
-	s.lock.Unlock()
+	//s.lock.Unlock()
 	err := s.sender.SendSyncRequest(&req, &reply)
 	if err != nil {
 		LogWarn("TCPConnState: error doing Sync: %v", err)
 	} else {
 		LogInfo("TCPConnState: Update reply: %+v", reply)
 	}
-	s.lock.Lock()
+	//s.lock.Lock()
 
 	// TODO: When the reply is received, it will tell us if the replica is behind
 	// and needs us to send it more data. See the last comment in
 	// SyncedBuffer.UpdateState() for details.
+
+	if reply.SendBufUpdate != nil {
+		s.sendBuf.UpdateState(reply.SendBufUpdate)
+	}
+	if reply.RecvBufUpdate != nil {
+		s.recvBuf.UpdateState(reply.RecvBufUpdate)
+	}
+	s.syncState(reply.State)
+
+	// Wake up any reader/writers in case buffer states have changed.
+	s.cond.Broadcast()
 }
 
 func (s *TCPConnState) syncState(reqState tcpConnState) {
@@ -486,7 +573,7 @@ func (s *TCPConnState) Sync(req *pb.SyncRequest, reply *pb.SyncReply) error {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
-	LogInfo("TCPConnState: received sync request: %+v", *req)
+	LogInfo("TCPConnState: received sync request")
 
 	if req.SendBufUpdate != nil {
 		reply.SendBufUpdate = &pb.BufferStateUpdate{}

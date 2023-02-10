@@ -64,12 +64,14 @@ func (b *SyncedBuffer) Free() int {
 
 func (b *SyncedBuffer) Ack(ack uint32) bool {
 	diff := ack - uint32(b.startSeq)
-	sentBytes := uint32(b.nextSeq - b.startSeq)
-	if diff > sentBytes {
-		LogDebug("ACK %d out of sent range [%d, %d) (buf end: %d)", ack, b.startSeq, b.nextSeq, b.EndSeq())
+	if diff > uint32(b.rb.Len()) {
+		LogDebug("ACK %d out of sent range [%d, %d)", ack, b.startSeq, b.EndSeq())
 		return false
 	}
 	b.startSeq += uint64(diff)
+	if b.nextSeq < b.startSeq {
+		b.ResetNextSeq()
+	}
 	b.rb.Consume(int(diff))
 	return diff > 0
 }
@@ -133,7 +135,7 @@ func (b *SyncedBuffer) UpdateState(req *pb.BufferStateUpdate) {
 
 	if req.AppendSeq != 0 {
 		currEndSeq := b.EndSeq()
-		if req.AppendSeq < currEndSeq {
+		if req.AppendSeq <= currEndSeq {
 			// Sender is behind us. Drop any data we already have, and append the
 			// rest.
 			diff := currEndSeq - req.AppendSeq
@@ -154,6 +156,9 @@ func (b *SyncedBuffer) UpdateState(req *pb.BufferStateUpdate) {
 			// but that would make the logic more complicated. For now, just drop the
 			// received data, and expect the sender to give us everything starting at
 			// the end of our buffer.
+			if req.AppendSeq > currEndSeq {
+				LogWarn("SyncedBuffer: TOO FAR BEHIND, MORE DATA NEEDED!!!")
+			}
 		}
 	}
 }

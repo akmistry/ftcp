@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"io"
 	"log"
 	"math/rand"
@@ -9,6 +8,7 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -20,9 +20,46 @@ const (
 	errorRateDenom = 4
 )
 
-func doEcho(r io.Reader, w io.WriteCloser) {
-	n, err := io.Copy(w, r)
-	log.Printf("io.Copy n: %d, err: %v", n, err)
+type StatelessConn interface {
+	ConsumeThenRead(b []byte, offset uint64) (int, error)
+	AppendAt(b []byte, offset uint64) (int, error)
+	Close() error
+}
+
+func doEcho(r StatelessConn, w StatelessConn, readBytes *int) {
+	buf := make([]byte, 4096)
+	offset := uint64(0)
+
+	for {
+		read, err := r.ConsumeThenRead(buf, offset)
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			panic(err)
+		}
+		*readBytes += read
+
+		// Randomly fail after the read to simulate an application failure
+		if rand.Intn(4) < 1 {
+			log.Print("AFTER READ FAILURE SIMULATED")
+			continue
+		}
+
+		written, err := w.AppendAt(buf[:read], offset)
+		if err != nil {
+			panic(err)
+		}
+		if read != written {
+			panic("read != written")
+		}
+
+		// Randonly don't persist "state" to simulate an application failure
+		if rand.Intn(4) < 1 {
+			log.Print("STATE PERSISTENCE FAILURE SIMULATED")
+			continue
+		}
+		offset += uint64(written)
+	}
 	w.Close()
 }
 
@@ -60,10 +97,9 @@ type testStack struct {
 	syncServ   *ftcp.SyncServer
 	syncClient *ftcp.SyncClient
 
-	shutdown bool
-	conn     ftcp.IPConn
-	lock     sync.Mutex
-	cond     *sync.Cond
+	conn ftcp.IPConn
+	lock sync.Mutex
+	cond *sync.Cond
 }
 
 func newTestStack(lAddr *net.IPAddr) *testStack {
@@ -100,22 +136,12 @@ func (s *testStack) run() {
 	}
 }
 
-func (s *testStack) shutDown() {
-	s.lock.Lock()
-	s.shutdown = true
-	s.cond.Signal()
-	s.lock.Unlock()
-}
-
 func (s *testStack) ReadFromIP(b []byte) (int, *net.IPAddr, error) {
 	s.lock.Lock()
-	for s.conn == nil && !s.shutdown {
+	for s.conn == nil {
 		s.cond.Wait()
 	}
 	s.lock.Unlock()
-	if s.shutdown {
-		return 0, nil, errors.New("testStack: shutdown")
-	}
 	return s.conn.ReadFromIP(b)
 }
 
@@ -131,7 +157,7 @@ func (s *testStack) WriteToIP(b []byte, addr *net.IPAddr) (int, error) {
 }
 
 func main() {
-	ftcp.SetLogLevel(ftcp.LOG_INFO)
+	ftcp.SetLogLevel(ftcp.LOG_DEBUG)
 
 	go func() {
 		log.Println("http.ListenAndServe: ", http.ListenAndServe("localhost:6060", nil))
@@ -175,7 +201,19 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-		go doEcho(ch, ch)
+		readBytes := 0
+		go doEcho(ch, ch, &readBytes)
+		go func() {
+			for {
+				time.Sleep(10 * time.Millisecond)
+				if readBytes > 30000 {
+					break
+				}
+			}
+			log.Print("SWITCHING CONNECTIONS")
+			ts1.setConn(nil)
+			ts2.setConn(adapter)
+		}()
 	}
 
 }

@@ -2,7 +2,6 @@ package ftcp
 
 import (
 	"errors"
-	"io"
 	"net"
 	"sync"
 
@@ -114,7 +113,7 @@ func (s *TCPStack) SendSyncRequest(req *pb.SyncRequest, reply *pb.SyncReply) err
 	return c.SendSync(req, reply)
 }
 
-func (s *TCPStack) Listen() (io.ReadWriteCloser, error) {
+func (s *TCPStack) Listen() (*TCPConnState, error) {
 	c := <-s.connCh
 	return c, nil
 }
