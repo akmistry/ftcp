@@ -46,9 +46,12 @@ message SyncRequest {
   BufferStateUpdate send_buf_update = 8;
 
   bool send_closed = 9;
+  uint64 send_init_seq = 10;
 
   // Buffer state update of the recv buffer
   BufferStateUpdate recv_buf_update = 12;
+
+  uint64 recv_init_seq = 13;
 }
 
 message SyncReply {

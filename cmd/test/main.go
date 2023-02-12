@@ -26,12 +26,31 @@ type StatelessConn interface {
 	Close() error
 }
 
-func doEcho(r StatelessConn, w StatelessConn, readBytes *int) {
-	buf := make([]byte, 4096)
-	offset := uint64(0)
+type echoServer struct {
+	buf    []byte
+	offset uint64
+	conn   StatelessConn
+	lock   sync.Mutex
+}
 
+func makeEchoServer(conn StatelessConn) *echoServer {
+	return &echoServer{
+		buf:  make([]byte, 4096),
+		conn: conn,
+	}
+}
+
+func (s *echoServer) switchConn(newConn StatelessConn) {
+	s.lock.Lock()
+	s.conn = newConn
+	s.lock.Unlock()
+}
+
+func (s *echoServer) run(readBytes *int) {
 	for {
-		read, err := r.ConsumeThenRead(buf, offset)
+		s.lock.Lock()
+		read, err := s.conn.ConsumeThenRead(s.buf, s.offset)
+		s.lock.Unlock()
 		if err == io.EOF {
 			break
 		} else if err != nil {
@@ -45,7 +64,9 @@ func doEcho(r StatelessConn, w StatelessConn, readBytes *int) {
 			continue
 		}
 
-		written, err := w.AppendAt(buf[:read], offset)
+		s.lock.Lock()
+		written, err := s.conn.AppendAt(s.buf[:read], s.offset)
+		s.lock.Unlock()
 		if err != nil {
 			panic(err)
 		}
@@ -58,9 +79,12 @@ func doEcho(r StatelessConn, w StatelessConn, readBytes *int) {
 			log.Print("STATE PERSISTENCE FAILURE SIMULATED")
 			continue
 		}
-		offset += uint64(written)
+		s.offset += uint64(written)
 	}
-	w.Close()
+
+	s.lock.Lock()
+	s.conn.Close()
+	s.lock.Unlock()
 }
 
 func dropPacket() bool {
@@ -202,7 +226,8 @@ func main() {
 			panic(err)
 		}
 		readBytes := 0
-		go doEcho(ch, ch, &readBytes)
+		s := makeEchoServer(ch)
+		go s.run(&readBytes)
 		go func() {
 			for {
 				time.Sleep(10 * time.Millisecond)
@@ -210,9 +235,14 @@ func main() {
 					break
 				}
 			}
-			log.Print("SWITCHING CONNECTIONS")
+			log.Print("FAILING OVER TCP STACKS")
 			ts1.setConn(nil)
+			time.Sleep(100 * time.Millisecond)
 			ts2.setConn(adapter)
+
+			newConn := ts2.tcpStack.GetConn(ch.RemoteIPAddr(), ch.RemotePort())
+			log.Print("SWITCHING CONNECTIONS")
+			s.switchConn(newConn)
 		}()
 	}
 

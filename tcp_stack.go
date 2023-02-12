@@ -118,6 +118,10 @@ func (s *TCPStack) Listen() (*TCPConnState, error) {
 	return c, nil
 }
 
+func (s *TCPStack) GetConn(remoteAddr *net.IPAddr, remotePort uint16) *TCPConnState {
+	return s.connMap.GetState(remoteAddr.IP, remotePort)
+}
+
 func (s *TCPStack) Sync(req *pb.SyncRequest, reply *pb.SyncReply) error {
 	if req.Key == nil {
 		return errors.New("TCPStack.Sync: request missing key")

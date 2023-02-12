@@ -99,6 +99,14 @@ func NewTCPConnState(localPort, remotePort uint16, sender TCPSender, remoteAddr 
 	return s
 }
 
+func (s *TCPConnState) RemoteIPAddr() *net.IPAddr {
+	return s.remoteAddr
+}
+
+func (s *TCPConnState) RemotePort() uint16 {
+	return s.remotePort
+}
+
 func (s *TCPConnState) retransmitTimeout() {
 	s.lock.Lock()
 	defer s.lock.Unlock()
@@ -413,7 +421,7 @@ func (s *TCPConnState) ConsumeThenRead(b []byte, offset uint64) (int, error) {
 
 	consumeSeq := s.recvInitSeq + offset
 	if consumeSeq < s.recvBuf.StartSeq() {
-		return 0, errors.New("TCPConnState: offset already consumed")
+		return 0, fmt.Errorf("TCPConnState: offset %d already consumed (recv buf range [%d, %d))", consumeSeq, s.recvBuf.StartSeq(), s.recvBuf.EndSeq())
 	} else if consumeSeq > s.recvBuf.EndSeq() {
 		return 0, errors.New("TCPConnState: offset ahead of data not read")
 	}
@@ -511,6 +519,9 @@ func (s *TCPConnState) sendSyncRequest() {
 		SendBufUpdate: &pb.BufferStateUpdate{},
 		SendClosed:    s.sendClosed,
 		RecvBufUpdate: &pb.BufferStateUpdate{},
+
+		SendInitSeq: s.sendInitSeq,
+		RecvInitSeq: s.recvInitSeq,
 	}
 	s.sendBuf.FillStateUpdate(req.SendBufUpdate)
 	s.recvBuf.FillStateUpdate(req.RecvBufUpdate)
@@ -619,6 +630,12 @@ func (s *TCPConnState) Sync(req *pb.SyncRequest, reply *pb.SyncReply) error {
 		s.sendClosed = req.SendClosed
 	}
 	reply.SendClosed = s.sendClosed
+	if req.SendInitSeq != 0 {
+		s.sendInitSeq = req.SendInitSeq
+	}
+	if req.RecvInitSeq != 0 {
+		s.recvInitSeq = req.RecvInitSeq
+	}
 
 	s.cond.Broadcast()
 
