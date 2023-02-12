@@ -27,6 +27,7 @@ probably the most well known. Like ftcp, tcpcp requires two servers to be
 in collusion. Whereas tcpcp is (quoted from the paper):
 >  ...primarily designed for scenarios, where the old and the new connection
 >  owner are both functional during the process of connection passing.
+
 ftcp is specifically intended for the situation where the old server is
 non-functional.
 
