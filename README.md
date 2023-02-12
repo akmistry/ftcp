@@ -25,8 +25,8 @@ existing software,
 [tcpcp](https://www.kernel.org/doc/ols/2004/ols2004v1-pages-9-22.pdf) is
 probably the most well known. Like ftcp, tcpcp requires two servers to be
 in collusion. Whereas tcpcp is (quoted from the paper):
-  ...primarily designed for scenarios, where the old and the new connection
-  owner are both functional during the process of connection passing.
+>  ...primarily designed for scenarios, where the old and the new connection
+>  owner are both functional during the process of connection passing.
 ftcp is specifically intended for the situation where the old server is
 non-functional.
 
